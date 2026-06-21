@@ -6,7 +6,16 @@
 
 #include "font5x7.h"
 #include "ui_fonts.h"
+
+#ifndef GLOBE_USE_HALF_TEXTURE
+#define GLOBE_USE_HALF_TEXTURE 0
+#endif
+
+#if GLOBE_USE_HALF_TEXTURE
+#include "world_texture_512.h"
+#else
 #include "world_texture.h"
+#endif
 
 #ifndef GLOBE_ENABLE_SERIAL_STATS
 #define GLOBE_ENABLE_SERIAL_STATS 0
@@ -14,6 +23,14 @@
 
 #ifndef GLOBE_ENABLE_SCREENSHOT
 #define GLOBE_ENABLE_SCREENSHOT 0
+#endif
+
+#ifndef GLOBE_DISPLAY_BUS_HZ
+#define GLOBE_DISPLAY_BUS_HZ 40000000
+#endif
+
+#ifndef GLOBE_TRANSFER_TIGHT
+#define GLOBE_TRANSFER_TIGHT 0
 #endif
 
 namespace {
@@ -38,6 +55,21 @@ constexpr int16_t kGlobeRadius = 211;
 constexpr int16_t kLutDiameter = kGlobeRadius * 2 + 1;
 constexpr int16_t kLutOriginX = kGlobeCenterX - kGlobeRadius;
 constexpr int16_t kLutOriginY = kGlobeCenterY - kGlobeRadius;
+constexpr int16_t kTransferWidth = kLutDiameter;
+constexpr int16_t kTransferHeight = kLutDiameter;
+constexpr int16_t kTransferX = kLutOriginX;
+constexpr int16_t kTransferY = kLutOriginY;
+#if GLOBE_TRANSFER_TIGHT
+constexpr int16_t kFrameWidth = kTransferWidth;
+constexpr int16_t kFrameHeight = kTransferHeight;
+constexpr int16_t kFrameScreenX = kTransferX;
+constexpr int16_t kFrameScreenY = kTransferY;
+#else
+constexpr int16_t kFrameWidth = kDisplayWidth;
+constexpr int16_t kFrameHeight = kDisplayHeight;
+constexpr int16_t kFrameScreenX = 0;
+constexpr int16_t kFrameScreenY = 0;
+#endif
 
 constexpr uint32_t kUMask = 0x3FFUL;
 constexpr uint32_t kShadeMask = 0x0FUL;
@@ -48,8 +80,9 @@ constexpr uint16_t kDateStyleBase = 272;
 constexpr uint16_t kOverlayStyleCount = 288;
 constexpr uint16_t kOverlayPixelCapacity = 16000;
 
-// 1024 texture texels per 18 seconds, represented as Q16.16 texels/ms.
-constexpr uint32_t kRotationStepQ16PerMs = 3728;
+// One full rotation per 18 seconds, represented as Q16.16 texels/ms.
+constexpr uint32_t kRotationStepQ16PerMs =
+    (static_cast<uint32_t>(world_texture::kWidth) << 16) / 18000U;
 
 Arduino_DataBus *displayBus = new Arduino_ESP32QSPI(
     kLcdCs, kLcdClock, kLcdData0, kLcdData1, kLcdData2, kLcdData3);
@@ -89,6 +122,10 @@ volatile uint32_t lastTransferMicros = 0;
 
 #if GLOBE_ENABLE_SCREENSHOT
 uint32_t renderedFrameCount = 0;
+volatile uint32_t transferredFrameCount = 0;
+uint32_t profileRenderMicros = 0;
+volatile uint32_t profileTransferMicros = 0;
+volatile uint32_t profileQspiMicros = 0;
 #endif
 
 QueueHandle_t freeFrameQueue = nullptr;
@@ -309,13 +346,14 @@ void buildSphereLut() {
   }
 }
 
-void initializeFrameBackground(uint16_t *buffer) {
+void initializeBackground(uint16_t *buffer, int16_t width, int16_t height,
+                          int16_t screenOriginX, int16_t screenOriginY) {
   // The exterior halo is static, so bake it into both reusable framebuffers.
   // The rotating sphere overwrites its own pixels each frame.
-  for (int16_t y = 0; y < kDisplayHeight; ++y) {
-    for (int16_t x = 0; x < kDisplayWidth; ++x) {
-      const float dx = x - kGlobeCenterX;
-      const float dy = y - kGlobeCenterY;
+  for (int16_t y = 0; y < height; ++y) {
+    for (int16_t x = 0; x < width; ++x) {
+      const float dx = x + screenOriginX - kGlobeCenterX;
+      const float dy = y + screenOriginY - kGlobeCenterY;
       const float exteriorDistance =
           sqrtf(dx * dx + dy * dy) - kGlobeRadius;
       uint16_t color = 0;
@@ -325,21 +363,23 @@ void initializeFrameBackground(uint16_t *buffer) {
         color = frame565(0, static_cast<uint8_t>(18.0f * strength),
                          static_cast<uint8_t>(34.0f * strength));
       }
-      buffer[static_cast<uint32_t>(y) * kDisplayWidth + x] = color;
+      buffer[static_cast<uint32_t>(y) * width + x] = color;
     }
   }
 }
 
 void fillRectClipped(int16_t x, int16_t y, int16_t width, int16_t height,
                      uint16_t color) {
-  const int16_t x0 = max<int16_t>(0, x);
-  const int16_t y0 = max<int16_t>(0, y);
-  const int16_t x1 = min<int16_t>(kDisplayWidth, x + width);
-  const int16_t y1 = min<int16_t>(kDisplayHeight, y + height);
+  const int16_t x0 = max<int16_t>(kFrameScreenX, x);
+  const int16_t y0 = max<int16_t>(kFrameScreenY, y);
+  const int16_t x1 = min<int16_t>(kFrameScreenX + kFrameWidth, x + width);
+  const int16_t y1 = min<int16_t>(kFrameScreenY + kFrameHeight, y + height);
   for (int16_t py = y0; py < y1; ++py) {
-    uint16_t *row = frameBuffer + static_cast<uint32_t>(py) * kDisplayWidth;
+    uint16_t *row =
+        frameBuffer +
+        static_cast<uint32_t>(py - kFrameScreenY) * kFrameWidth;
     for (int16_t px = x0; px < x1; ++px) {
-      row[px] = color;
+      row[px - kFrameScreenX] = color;
     }
   }
 }
@@ -423,7 +463,8 @@ void blendFramePixel(uint16_t *destination, uint16_t sourceFrame,
 }
 
 void appendOverlayPixel(int16_t x, int16_t y, uint16_t styleIndex) {
-  if (x < 0 || x >= kDisplayWidth || y < 0 || y >= kDisplayHeight ||
+  if (x < kFrameScreenX || x >= kFrameScreenX + kFrameWidth ||
+      y < kFrameScreenY || y >= kFrameScreenY + kFrameHeight ||
       overlayAlphas[styleIndex] == 0) {
     return;
   }
@@ -438,7 +479,8 @@ void appendOverlayPixel(int16_t x, int16_t y, uint16_t styleIndex) {
     return;
   }
   const uint32_t frameOffset =
-      static_cast<uint32_t>(y) * kDisplayWidth + x;
+      static_cast<uint32_t>(y - kFrameScreenY) * kFrameWidth +
+      (x - kFrameScreenX);
   overlayPixels[overlayPixelCount++] =
       frameOffset | (static_cast<uint32_t>(styleIndex) << 18);
 }
@@ -575,13 +617,13 @@ void sendFramebufferScreenshot() {
   // "GLB2", uint16 width, uint16 height, uint32 byte_count, uint32 CRC32,
   // followed by RGB565 bytes in panel order (big endian).
   const uint32_t byteCount =
-      static_cast<uint32_t>(kDisplayWidth) * kDisplayHeight * sizeof(uint16_t);
+      static_cast<uint32_t>(kFrameWidth) * kFrameHeight * sizeof(uint16_t);
   const uint8_t *bytes = reinterpret_cast<const uint8_t *>(frameBuffer);
   const uint32_t checksum = crc32(bytes, byteCount);
 
   Serial.write(reinterpret_cast<const uint8_t *>("GLB2"), 4);
-  writeLittleEndian16(kDisplayWidth);
-  writeLittleEndian16(kDisplayHeight);
+  writeLittleEndian16(kFrameWidth);
+  writeLittleEndian16(kFrameHeight);
   writeLittleEndian32(byteCount);
   writeLittleEndian32(checksum);
   Serial.write(bytes, byteCount);
@@ -597,6 +639,20 @@ void sendPerformanceSnapshot() {
   Serial.flush();
 }
 
+void sendDetailedPerformanceSnapshot() {
+  // "GLBQ", uptime, rendered frames, transferred frames, cumulative render
+  // microseconds, cumulative transfer-task microseconds, cumulative QSPI-only
+  // microseconds. The quiet screenshot build emits this only on a 'Q' request.
+  Serial.write(reinterpret_cast<const uint8_t *>("GLBQ"), 4);
+  writeLittleEndian32(millis());
+  writeLittleEndian32(renderedFrameCount);
+  writeLittleEndian32(transferredFrameCount);
+  writeLittleEndian32(profileRenderMicros);
+  writeLittleEndian32(profileTransferMicros);
+  writeLittleEndian32(profileQspiMicros);
+  Serial.flush();
+}
+
 void serviceSerialCommands() {
   while (Serial.available() > 0) {
     const int command = Serial.read();
@@ -604,6 +660,8 @@ void serviceSerialCommands() {
       sendFramebufferScreenshot();
     } else if (command == 'P' || command == 'p') {
       sendPerformanceSnapshot();
+    } else if (command == 'Q' || command == 'q') {
+      sendDetailedPerformanceSnapshot();
     }
   }
 }
@@ -613,13 +671,34 @@ void displayTask(void *parameter) {
   uint16_t *buffer = nullptr;
   while (true) {
     if (xQueueReceive(readyFrameQueue, &buffer, portMAX_DELAY) == pdTRUE) {
-#if GLOBE_ENABLE_SERIAL_STATS
+#if GLOBE_ENABLE_SERIAL_STATS || GLOBE_ENABLE_SCREENSHOT
       const uint32_t transferStartUs = micros();
+#endif
+#if GLOBE_TRANSFER_TIGHT
+#if GLOBE_ENABLE_SCREENSHOT
+      const uint32_t qspiStartUs = micros();
+#endif
+      display->draw16bitBeRGBBitmap(kTransferX, kTransferY, buffer,
+                                    kTransferWidth, kTransferHeight);
+#if GLOBE_ENABLE_SCREENSHOT
+      profileQspiMicros += micros() - qspiStartUs;
+#endif
+#else
+#if GLOBE_ENABLE_SCREENSHOT
+      const uint32_t qspiStartUs = micros();
 #endif
       display->draw16bitBeRGBBitmap(0, 0, buffer, kDisplayWidth,
                                     kDisplayHeight);
+#if GLOBE_ENABLE_SCREENSHOT
+      profileQspiMicros += micros() - qspiStartUs;
+#endif
+#endif
 #if GLOBE_ENABLE_SERIAL_STATS
       lastTransferMicros = micros() - transferStartUs;
+#endif
+#if GLOBE_ENABLE_SCREENSHOT
+      profileTransferMicros += micros() - transferStartUs;
+      transferredFrameCount = transferredFrameCount + 1;
 #endif
       xQueueSend(freeFrameQueue, &buffer, portMAX_DELAY);
     }
@@ -628,15 +707,16 @@ void displayTask(void *parameter) {
 
 void renderFrame(uint16_t rotationTexels) {
   for (int16_t localY = 0; localY < kLutDiameter; ++localY) {
-    uint16_t *destination =
-        frameBuffer + static_cast<uint32_t>(kLutOriginY + localY) *
-                          kDisplayWidth +
-        kLutOriginX;
+    uint16_t *destination = frameBuffer +
+                            static_cast<uint32_t>(
+                                kLutOriginY + localY - kFrameScreenY) *
+                                kFrameWidth +
+                            (kLutOriginX - kFrameScreenX);
     const uint16_t *lutRow =
         sphereLut + static_cast<uint32_t>(localY) * kLutDiameter;
     const uint16_t v = sphereV[localY];
     const uint8_t *textureRow =
-        worldTexture + (static_cast<uint32_t>(v) << 10);
+        worldTexture + static_cast<uint32_t>(v) * world_texture::kWidth;
 
     for (uint16_t localX = sphereLeft[localY];
          localX <= sphereRight[localY]; ++localX) {
@@ -648,7 +728,9 @@ void renderFrame(uint16_t rotationTexels) {
       // longitude. Sampling its blurred channel makes the back of the
       // transparent globe visible beneath the front surface.
       const uint16_t backU =
-          (1536U - baseU + rotationTexels) & (world_texture::kWidth - 1);
+          (world_texture::kWidth + world_texture::kWidth / 2U - baseU +
+           rotationTexels) &
+          (world_texture::kWidth - 1);
       const uint8_t frontPacked = textureRow[frontU];
       const uint8_t backPacked = textureRow[backU];
       const uint8_t frontIntensity = frontPacked >> 4;
@@ -712,7 +794,7 @@ void setup() {
 #endif
   }
 
-  if (!display->begin(40000000)) {
+  if (!display->begin(GLOBE_DISPLAY_BUS_HZ)) {
 #if GLOBE_ENABLE_SERIAL_STATS
     Serial.println("Display initialization failed");
 #endif
@@ -727,8 +809,24 @@ void setup() {
     haltWithMessage("PSRAM NOT FOUND");
   }
 
-  const size_t frameByteCount =
+#if GLOBE_TRANSFER_TIGHT
+  // The halo extends beyond the moving 423x423 region. Transfer it once as a
+  // full-screen static background, then release this temporary buffer.
+  const size_t staticBackgroundByteCount =
       static_cast<size_t>(kDisplayWidth) * kDisplayHeight * sizeof(uint16_t);
+  uint16_t *staticBackground = static_cast<uint16_t *>(heap_caps_malloc(
+      staticBackgroundByteCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (staticBackground == nullptr) {
+    haltWithMessage("STATIC BACKGROUND FAILED");
+  }
+  initializeBackground(staticBackground, kDisplayWidth, kDisplayHeight, 0, 0);
+  display->draw16bitBeRGBBitmap(0, 0, staticBackground, kDisplayWidth,
+                                kDisplayHeight);
+  heap_caps_free(staticBackground);
+#endif
+
+  const size_t frameByteCount =
+      static_cast<size_t>(kFrameWidth) * kFrameHeight * sizeof(uint16_t);
   for (uint8_t index = 0; index < 2; ++index) {
     frameBuffers[index] = static_cast<uint16_t *>(heap_caps_malloc(
         frameByteCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -745,8 +843,10 @@ void setup() {
       sphereLut == nullptr || overlayPixels == nullptr) {
     haltWithMessage("PSRAM ALLOCATION FAILED");
   }
-  initializeFrameBackground(frameBuffers[0]);
-  initializeFrameBackground(frameBuffers[1]);
+  initializeBackground(frameBuffers[0], kFrameWidth, kFrameHeight,
+                       kFrameScreenX, kFrameScreenY);
+  initializeBackground(frameBuffers[1], kFrameWidth, kFrameHeight,
+                       kFrameScreenX, kFrameScreenY);
 
   buildColorPalettes();
   buildSphereLut();
@@ -771,7 +871,7 @@ void setup() {
 
 #if GLOBE_ENABLE_SERIAL_STATS
   Serial.printf("Frame buffer: %u bytes\n",
-                kDisplayWidth * kDisplayHeight * sizeof(uint16_t));
+                kFrameWidth * kFrameHeight * sizeof(uint16_t));
   Serial.printf("Sphere LUT:   %u bytes\n",
                 kLutDiameter * kLutDiameter * sizeof(uint16_t));
   Serial.printf("World texture:%u bytes\n", world_texture::kByteCount);
@@ -795,12 +895,15 @@ void loop() {
   }
   rotationQ16 += elapsedMs * kRotationStepQ16PerMs;
 
-#if GLOBE_ENABLE_SERIAL_STATS
+#if GLOBE_ENABLE_SERIAL_STATS || GLOBE_ENABLE_SCREENSHOT
   const uint32_t renderStartUs = micros();
 #endif
   renderFrame((rotationQ16 >> 16) & (world_texture::kWidth - 1));
 #if GLOBE_ENABLE_SERIAL_STATS
   renderMicrosAccumulated += micros() - renderStartUs;
+#endif
+#if GLOBE_ENABLE_SCREENSHOT
+  profileRenderMicros += micros() - renderStartUs;
 #endif
   xQueueSend(readyFrameQueue, &renderBuffer, portMAX_DELAY);
 

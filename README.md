@@ -40,7 +40,8 @@ rendering after several seconds.
 `waveshare_amoled_143_screenshot` is a quiet diagnostic environment with
 screenshots enabled but periodic serial stats disabled. Sending `P` returns a
 compact uptime/frame-count record for stability testing without autonomous USB
-output.
+output. Sending `Q` additionally returns cumulative render, transfer-task, and
+QSPI-only timings.
 
 ## Rendering design
 
@@ -66,18 +67,49 @@ output.
 - Frame rendering contains no floating-point math.
 - Two PSRAM framebuffers form a producer/consumer pipeline: core 1 renders while
   core 0 transfers the previous frame over QSPI.
+- The moving content is rendered directly into packed 423×423 framebuffers and
+  transferred at screen position `(22,22)`. A temporary full-screen buffer
+  transfers the static exterior halo once during startup.
 - RGB565 is stored in panel byte order so QSPI can send framebuffer bytes
   directly without a per-pixel byte-swap pass.
 
-Each framebuffer uses about 434 KB and the sphere LUT about 358 KB. The measured
-rate on the target board is a stable 19.25 FPS with the antialiased overlay,
-compared with 5 FPS for the initial single-buffer renderer.
+Each packed framebuffer and the sphere LUT use about 358 KB. The release build
+uses 8192-pixel QSPI chunks and an 80 MHz requested bus clock. The measured rate
+on the connected target board is a stable 20.31 FPS with the antialiased
+overlay, compared with 5 FPS for the initial single-buffer renderer.
+
+## Performance profiling
+
+Build and upload `waveshare_amoled_143_screenshot`, then run:
+
+```powershell
+python tools/profile_performance.py --port COM21
+```
+
+The script samples quiet on-demand counters and reports average FPS, render
+time, complete transfer-task time, and QSPI-only time. Measurements on this
+board:
+
+| Configuration | Render | Transfer | FPS |
+|---|---:|---:|---:|
+| Original full 466×466, 4096 chunk, 40 MHz | 52.63 ms | 38.63 ms | 19.00 |
+| Packed 423×423, 4096 chunk, 40 MHz | 50.18 ms | 31.43 ms | 19.92 |
+| Packed, 8192 chunk, 40/60 MHz request | 50.24 ms | 30.85 ms | 19.90 |
+| Packed, 16384 chunk, 40 MHz | 50.63 ms | 31.48 ms | 19.74 |
+| Packed, 8192 chunk, 80 MHz, 1024×512 map | 49.23 ms | 22.22 ms | 20.31 |
+| Packed, 8192 chunk, 80 MHz, 512×256 map | 38.88 ms | 20.48 ms | 25.71 |
+
+The 60 MHz request measured identically to 40 MHz, consistent with the ESP32
+SPI divider selecting the same effective clock. The 512×256 texture is retained
+as an optional `GLOBE_USE_HALF_TEXTURE=1` mode, but is not the release default:
+its coastlines are visibly more pixelated despite the large speed and flash
+savings.
 
 ## Capturing the framebuffer
 
 This is available in `waveshare_amoled_143_debug` and in the quiet
 `waveshare_amoled_143_screenshot` environment. The firmware accepts `S` over USB
-serial and returns the current 466×466 RGB565 frame with dimensions and CRC32.
+serial and returns the current RGB565 framebuffer with dimensions and CRC32.
 Capture it as a PNG with:
 
 ```powershell
@@ -87,6 +119,8 @@ python tools/capture_screenshot.py --port COM21 --output globe-screenshot.png
 
 This validates the renderer and framebuffer contents independently of the
 physical AMOLED. It cannot detect panel power, wiring, or viewing problems.
+With `GLOBE_TRANSFER_TIGHT=1`, the returned framebuffer is the packed 423×423
+moving region rather than the static 466×466 panel background.
 
 ## Regenerating the map
 
@@ -94,6 +128,8 @@ The generated header is already included. To rebuild it:
 
 ```powershell
 python tools/generate_world_map.py --supersample 4
+python tools/generate_world_map.py --width 512 --height 256 --supersample 4 `
+  --output src/world_texture_512.h --preview world-texture-512-preview.png
 ```
 
 The script downloads pinned Natural Earth physical vector layers, filters lakes
