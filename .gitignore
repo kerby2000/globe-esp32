@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+*.code-workspace
+globe-screenshot*.png
