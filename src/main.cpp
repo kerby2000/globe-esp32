@@ -11,10 +11,18 @@
 #define GLOBE_USE_HALF_TEXTURE 0
 #endif
 
+#ifndef GLOBE_USE_HALF_BACK_TEXTURE
+#define GLOBE_USE_HALF_BACK_TEXTURE 0
+#endif
+
 #if GLOBE_USE_HALF_TEXTURE
 #include "world_texture_512.h"
 #else
 #include "world_texture.h"
+#endif
+
+#if GLOBE_USE_HALF_BACK_TEXTURE
+#include "world_back_512.h"
 #endif
 
 #ifndef GLOBE_ENABLE_SERIAL_STATS
@@ -31,6 +39,46 @@
 
 #ifndef GLOBE_TRANSFER_TIGHT
 #define GLOBE_TRANSFER_TIGHT 0
+#endif
+
+#ifndef GLOBE_ENABLE_OVERLAY
+#define GLOBE_ENABLE_OVERLAY 1
+#endif
+
+#ifndef GLOBE_ENABLE_BACK_HEMISPHERE
+#define GLOBE_ENABLE_BACK_HEMISPHERE 1
+#endif
+
+#ifndef GLOBE_ENABLE_DISPLAY_TRANSFER
+#define GLOBE_ENABLE_DISPLAY_TRANSFER 1
+#endif
+
+#ifndef GLOBE_USE_DIRECT_COLOR_TABLE
+#define GLOBE_USE_DIRECT_COLOR_TABLE 0
+#endif
+
+#ifndef GLOBE_RENDER_UNROLL
+#define GLOBE_RENDER_UNROLL 0
+#endif
+
+#ifndef GLOBE_RENDER_O3
+#define GLOBE_RENDER_O3 0
+#endif
+
+#ifndef GLOBE_RENDER_IRAM
+#define GLOBE_RENDER_IRAM 0
+#endif
+
+#if GLOBE_RENDER_O3
+#define GLOBE_RENDER_OPT __attribute__((optimize("O3")))
+#else
+#define GLOBE_RENDER_OPT
+#endif
+
+#if GLOBE_RENDER_IRAM
+#define GLOBE_RENDER_MEM IRAM_ATTR
+#else
+#define GLOBE_RENDER_MEM
 #endif
 
 namespace {
@@ -59,6 +107,10 @@ constexpr int16_t kTransferWidth = kLutDiameter;
 constexpr int16_t kTransferHeight = kLutDiameter;
 constexpr int16_t kTransferX = kLutOriginX;
 constexpr int16_t kTransferY = kLutOriginY;
+#if GLOBE_USE_HALF_BACK_TEXTURE
+static_assert(world_back_texture::kWidth * 2 == world_texture::kWidth);
+static_assert(world_back_texture::kHeight * 2 == world_texture::kHeight);
+#endif
 #if GLOBE_TRANSFER_TIGHT
 constexpr int16_t kFrameWidth = kTransferWidth;
 constexpr int16_t kFrameHeight = kTransferHeight;
@@ -102,7 +154,11 @@ uint16_t sphereLeft[kLutDiameter];
 uint16_t sphereRight[kLutDiameter];
 uint16_t sphereV[kLutDiameter];
 
+#if GLOBE_USE_DIRECT_COLOR_TABLE
+uint16_t globeColorTable[64 * 256];
+#else
 uint16_t globePalette[4 * 16 * 16];
+#endif
 uint16_t overlayColors[kOverlayStyleCount];
 uint8_t overlayAlphas[kOverlayStyleCount];
 uint32_t *overlayPixels = nullptr;
@@ -124,6 +180,8 @@ volatile uint32_t lastTransferMicros = 0;
 uint32_t renderedFrameCount = 0;
 volatile uint32_t transferredFrameCount = 0;
 uint32_t profileRenderMicros = 0;
+uint32_t profileGlobeMicros = 0;
+uint32_t profileOverlayMicros = 0;
 volatile uint32_t profileTransferMicros = 0;
 volatile uint32_t profileQspiMicros = 0;
 #endif
@@ -201,6 +259,32 @@ uint8_t clampByte(int value) {
 }
 
 void buildColorPalettes() {
+#if GLOBE_USE_DIRECT_COLOR_TABLE
+  for (int coverage = 0; coverage < 4; ++coverage) {
+    for (int shade = 0; shade < 16; ++shade) {
+      const int shade63 = (shade * 63 + 7) / 15;
+      const uint16_t surfaceIndex =
+          static_cast<uint16_t>((coverage << 4) | shade);
+      for (int frontIntensity = 0; frontIntensity < 16; ++frontIntensity) {
+        for (int backIntensity = 0; backIntensity < 16; ++backIntensity) {
+          const int backContribution = (backIntensity * 3 + 2) >> 2;
+          const int intensity =
+              min(15, frontIntensity + backContribution);
+          const int highlight = max(0, intensity - 10);
+          const int red = intensity * 6 + highlight * 11 + shade63 / 7;
+          const int green = 3 + intensity * 13 + shade63 / 2;
+          const int blue = 7 + intensity * 16 + shade63;
+          const uint16_t textureIndex =
+              static_cast<uint16_t>((frontIntensity << 4) | backIntensity);
+          globeColorTable[(surfaceIndex << 8) | textureIndex] =
+              frame565(clampByte(red * coverage / 3),
+                       clampByte(green * coverage / 3),
+                       clampByte(blue * coverage / 3));
+        }
+      }
+    }
+  }
+#else
   for (int coverage = 0; coverage < 4; ++coverage) {
     for (int shade = 0; shade < 16; ++shade) {
       for (int intensity = 0; intensity < 16; ++intensity) {
@@ -218,6 +302,7 @@ void buildColorPalettes() {
       }
     }
   }
+#endif
 
   // Collapse foreground alpha and glow alpha into one source color/alpha pair.
   // This preserves the soft clock halo while requiring only one RGB565 blend
@@ -641,13 +726,16 @@ void sendPerformanceSnapshot() {
 
 void sendDetailedPerformanceSnapshot() {
   // "GLBQ", uptime, rendered frames, transferred frames, cumulative render
-  // microseconds, cumulative transfer-task microseconds, cumulative QSPI-only
-  // microseconds. The quiet screenshot build emits this only on a 'Q' request.
+  // microseconds, cumulative globe and overlay microseconds, cumulative
+  // transfer-task microseconds, and cumulative QSPI-only microseconds. The
+  // quiet screenshot build emits this only on a 'Q' request.
   Serial.write(reinterpret_cast<const uint8_t *>("GLBQ"), 4);
   writeLittleEndian32(millis());
   writeLittleEndian32(renderedFrameCount);
   writeLittleEndian32(transferredFrameCount);
   writeLittleEndian32(profileRenderMicros);
+  writeLittleEndian32(profileGlobeMicros);
+  writeLittleEndian32(profileOverlayMicros);
   writeLittleEndian32(profileTransferMicros);
   writeLittleEndian32(profileQspiMicros);
   Serial.flush();
@@ -674,6 +762,7 @@ void displayTask(void *parameter) {
 #if GLOBE_ENABLE_SERIAL_STATS || GLOBE_ENABLE_SCREENSHOT
       const uint32_t transferStartUs = micros();
 #endif
+#if GLOBE_ENABLE_DISPLAY_TRANSFER
 #if GLOBE_TRANSFER_TIGHT
 #if GLOBE_ENABLE_SCREENSHOT
       const uint32_t qspiStartUs = micros();
@@ -693,6 +782,7 @@ void displayTask(void *parameter) {
       profileQspiMicros += micros() - qspiStartUs;
 #endif
 #endif
+#endif
 #if GLOBE_ENABLE_SERIAL_STATS
       lastTransferMicros = micros() - transferStartUs;
 #endif
@@ -705,49 +795,134 @@ void displayTask(void *parameter) {
   }
 }
 
-void renderFrame(uint16_t rotationTexels) {
+__attribute__((always_inline)) inline uint16_t sampleGlobeColor(
+    uint16_t sample, const uint8_t *__restrict__ textureRow,
+    const uint8_t *__restrict__ backTextureRow,
+    uint16_t rotationTexels) {
+  const uint16_t baseU = sample & kUMask;
+  const uint16_t frontU =
+      (baseU + rotationTexels) & (world_texture::kWidth - 1);
+  const uint8_t frontPacked = textureRow[frontU];
+#if GLOBE_ENABLE_BACK_HEMISPHERE
+  const uint16_t backUFull =
+      (world_texture::kWidth + world_texture::kWidth / 2U - baseU +
+       rotationTexels) &
+      (world_texture::kWidth - 1);
+#if GLOBE_USE_HALF_BACK_TEXTURE
+  const uint16_t backU = backUFull >> 1;
+  const uint8_t backPair = backTextureRow[backU >> 1];
+  const uint8_t backIntensity =
+      (backU & 1U) ? (backPair & 0x0FU) : (backPair >> 4);
+#else
+  const uint8_t backPacked = backTextureRow[backUFull];
+#endif
+#if GLOBE_USE_DIRECT_COLOR_TABLE
+  const uint16_t textureIndex =
+      static_cast<uint16_t>(
+          (frontPacked & 0xF0U) |
+#if GLOBE_USE_HALF_BACK_TEXTURE
+          backIntensity
+#else
+          (backPacked & 0x0FU)
+#endif
+      );
+#else
+  const uint8_t frontIntensity = frontPacked >> 4;
+#if !GLOBE_USE_HALF_BACK_TEXTURE
+  const uint8_t backIntensity = backPacked & 0x0F;
+#endif
+  const uint8_t backContribution =
+      static_cast<uint8_t>((backIntensity * 3 + 2) >> 2);
+  const uint8_t intensity =
+      min<uint8_t>(15, frontIntensity + backContribution);
+#endif
+#else
+#if GLOBE_USE_DIRECT_COLOR_TABLE
+  const uint16_t textureIndex = frontPacked & 0xF0U;
+#else
+  const uint8_t intensity = frontPacked >> 4;
+#endif
+#endif
+
+#if GLOBE_USE_DIRECT_COLOR_TABLE
+  return globeColorTable[((sample >> 10) << 8) | textureIndex];
+#else
+  const uint8_t shade = (sample >> 10) & kShadeMask;
+  const uint8_t coverage = sample >> 14;
+  return globePalette[(coverage << 8) | (shade << 4) | intensity];
+#endif
+}
+
+GLOBE_RENDER_MEM GLOBE_RENDER_OPT void renderGlobe(uint16_t rotationTexels) {
   for (int16_t localY = 0; localY < kLutDiameter; ++localY) {
-    uint16_t *destination = frameBuffer +
-                            static_cast<uint32_t>(
-                                kLutOriginY + localY - kFrameScreenY) *
-                                kFrameWidth +
-                            (kLutOriginX - kFrameScreenX);
-    const uint16_t *lutRow =
+    uint16_t *__restrict__ destination =
+        frameBuffer +
+        static_cast<uint32_t>(kLutOriginY + localY - kFrameScreenY) *
+            kFrameWidth +
+        (kLutOriginX - kFrameScreenX);
+    const uint16_t *__restrict__ lutRow =
         sphereLut + static_cast<uint32_t>(localY) * kLutDiameter;
     const uint16_t v = sphereV[localY];
-    const uint8_t *textureRow =
+    const uint8_t *__restrict__ textureRow =
         worldTexture + static_cast<uint32_t>(v) * world_texture::kWidth;
+#if GLOBE_USE_HALF_BACK_TEXTURE
+    const uint8_t *__restrict__ backTextureRow =
+        world_back_texture::kIntensity +
+        static_cast<uint32_t>(v >> 1) * world_back_texture::kRowByteCount;
+#else
+    const uint8_t *__restrict__ backTextureRow = textureRow;
+#endif
 
+#if GLOBE_RENDER_UNROLL == 0
     for (uint16_t localX = sphereLeft[localY];
          localX <= sphereRight[localY]; ++localX) {
-      const uint16_t sample = lutRow[localX];
-      const uint16_t baseU = sample & kUMask;
-      const uint16_t frontU =
-          (baseU + rotationTexels) & (world_texture::kWidth - 1);
-      // The far intersection of the same viewing ray is the opposite
-      // longitude. Sampling its blurred channel makes the back of the
-      // transparent globe visible beneath the front surface.
-      const uint16_t backU =
-          (world_texture::kWidth + world_texture::kWidth / 2U - baseU +
-           rotationTexels) &
-          (world_texture::kWidth - 1);
-      const uint8_t frontPacked = textureRow[frontU];
-      const uint8_t backPacked = textureRow[backU];
-      const uint8_t frontIntensity = frontPacked >> 4;
-      const uint8_t backIntensity = backPacked & 0x0F;
-      const uint8_t backContribution =
-          static_cast<uint8_t>((backIntensity * 3 + 2) >> 2);
-      const uint8_t intensity =
-          min<uint8_t>(15, frontIntensity + backContribution);
-      const uint8_t shade = (sample >> 10) & kShadeMask;
-      const uint8_t coverage = sample >> 14;
-
       destination[localX] =
-          globePalette[(coverage << 8) | (shade << 4) | intensity];
+          sampleGlobeColor(lutRow[localX], textureRow, backTextureRow,
+                           rotationTexels);
     }
+#else
+    const uint16_t left = sphereLeft[localY];
+    uint16_t *__restrict__ dst = destination + left;
+    const uint16_t *__restrict__ lut = lutRow + left;
+    uint16_t count = sphereRight[localY] - left + 1;
+#if GLOBE_RENDER_UNROLL == 2
+    while (count >= 2) {
+      const uint16_t sample0 = *lut++;
+      const uint16_t sample1 = *lut++;
+      *dst++ =
+          sampleGlobeColor(sample0, textureRow, backTextureRow, rotationTexels);
+      *dst++ =
+          sampleGlobeColor(sample1, textureRow, backTextureRow, rotationTexels);
+      count -= 2;
+    }
+#endif
+    while (count != 0) {
+      *dst++ =
+          sampleGlobeColor(*lut++, textureRow, backTextureRow, rotationTexels);
+      --count;
+    }
+#endif
   }
+}
 
+void renderFrame(uint16_t rotationTexels) {
+#if GLOBE_ENABLE_SCREENSHOT
+  const uint32_t globeStartUs = micros();
+#endif
+  renderGlobe(rotationTexels);
+#if GLOBE_ENABLE_SCREENSHOT
+  profileGlobeMicros += micros() - globeStartUs;
+#endif
+
+#if GLOBE_ENABLE_OVERLAY
+#if GLOBE_ENABLE_SCREENSHOT
+  const uint32_t overlayStartUs = micros();
+#endif
   drawOverlay();
+#if GLOBE_ENABLE_SCREENSHOT
+  profileOverlayMicros += micros() - overlayStartUs;
+#endif
+#endif
 }
 
 [[noreturn]] void haltWithMessage(const char *message) {

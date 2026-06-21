@@ -3,5 +3,4 @@
 __pycache__/
 *.pyc
 *.code-workspace
-globe-esp32.zip
-globe-esp32_v0.3.zip
+globe-esp32*.zip

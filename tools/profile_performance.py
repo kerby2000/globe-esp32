@@ -11,7 +11,7 @@ import serial
 
 
 MAGIC = b"GLBQ"
-RECORD = struct.Struct("<6I")
+RECORD = struct.Struct("<8I")
 
 
 def read_exact(port: serial.Serial, length: int, deadline: float) -> bytes:
@@ -67,8 +67,11 @@ def main() -> None:
         time.sleep(args.warmup)
         previous = snapshot(port)
 
-        print("sample  fps    render_ms  transfer_ms  qspi_ms")
-        totals = [0.0, 0.0, 0.0, 0.0]
+        print(
+            "sample  fps    render_ms  globe_ms  overlay_ms"
+            "  transfer_ms  qspi_ms"
+        )
+        totals = [0.0] * 6
         for sample_index in range(1, args.samples + 1):
             time.sleep(args.interval)
             current = snapshot(port)
@@ -76,28 +79,36 @@ def main() -> None:
             rendered = delta32(current[1], previous[1])
             transferred = delta32(current[2], previous[2])
             render_us = delta32(current[3], previous[3])
-            transfer_us = delta32(current[4], previous[4])
-            qspi_us = delta32(current[5], previous[5])
+            globe_us = delta32(current[4], previous[4])
+            overlay_us = delta32(current[5], previous[5])
+            transfer_us = delta32(current[6], previous[6])
+            qspi_us = delta32(current[7], previous[7])
 
             fps = rendered * 1000.0 / elapsed_ms
             render_ms = render_us / max(1, rendered) / 1000.0
+            globe_ms = globe_us / max(1, rendered) / 1000.0
+            overlay_ms = overlay_us / max(1, rendered) / 1000.0
             transfer_ms = transfer_us / max(1, transferred) / 1000.0
             qspi_ms = qspi_us / max(1, transferred) / 1000.0
             print(
                 f"{sample_index:>6}  {fps:5.2f}  {render_ms:9.3f}"
+                f"  {globe_ms:8.3f}  {overlay_ms:10.3f}"
                 f"  {transfer_ms:11.3f}  {qspi_ms:7.3f}"
             )
             totals[0] += fps
             totals[1] += render_ms
-            totals[2] += transfer_ms
-            totals[3] += qspi_ms
+            totals[2] += globe_ms
+            totals[3] += overlay_ms
+            totals[4] += transfer_ms
+            totals[5] += qspi_ms
             previous = current
 
     count = max(1, args.samples)
     print(
         "average "
         f"{totals[0] / count:5.2f}  {totals[1] / count:9.3f}"
-        f"  {totals[2] / count:11.3f}  {totals[3] / count:7.3f}"
+        f"  {totals[2] / count:8.3f}  {totals[3] / count:10.3f}"
+        f"  {totals[4] / count:11.3f}  {totals[5] / count:7.3f}"
     )
 
 

@@ -50,16 +50,18 @@ QSPI-only timings.
   political borders.
 - Natural Earth vectors are rasterized at 4096×2048 and reduced with LANCZOS,
   preserving fractional coastline coverage before the 4-bit quantization.
-- Each texture byte contains a detailed front-surface channel and a broad
-  blurred back-surface channel, producing the transparent-globe underlay.
+- The detailed front surface remains at 1024×512. A separate 512×256 texture
+  packs two four-bit blurred back-surface samples per byte, producing the
+  transparent-globe underlay with lower PSRAM/cache traffic.
 - At startup, `buildSphereLut()` projects globe pixels to longitude and stores
   longitude, four-bit shading, and two-bit subpixel rim coverage in a compact
   16-bit PSRAM LUT. Latitude is shared by each scanline.
 - A static exterior cyan halo is baked into both reusable framebuffers. A 4×4
   setup-time coverage estimate smooths the sphere silhouette.
 - The expensive `sqrt`, `asin`, and `atan2` calls run only once during setup.
-- Each frame uses two integer texture samples, selects a precomputed RGB565
-  palette entry, and composites the fixed overlay.
+- Each frame uses integer texture samples and directly indexes a 32 KB
+  precomputed RGB565 color table. The hot scanline loop is unrolled by two,
+  compiled with targeted `-O3`, and placed in internal executable RAM.
 - The clock, weekday, and date use offline-generated four-bit alpha glyphs.
   The large time includes a baked soft cyan glow. Transparent glyph pixels are
   rejected at setup and the remaining pixels are stored as a compact command
@@ -73,10 +75,12 @@ QSPI-only timings.
 - RGB565 is stored in panel byte order so QSPI can send framebuffer bytes
   directly without a per-pixel byte-swap pass.
 
-Each packed framebuffer and the sphere LUT use about 358 KB. The release build
-uses 8192-pixel QSPI chunks and an 80 MHz requested bus clock. The measured rate
-on the connected target board is a stable 20.31 FPS with the antialiased
-overlay, compared with 5 FPS for the initial single-buffer renderer.
+Each packed framebuffer and the sphere LUT use about 358 KB. The dedicated
+back-surface texture uses 64 KB of flash, while the direct color table uses
+32 KB of internal RAM. The release build uses 8192-pixel QSPI chunks and an
+80 MHz requested bus clock. The measured rate on the connected target board is
+a stable 27.08 FPS with the antialiased overlay, compared with 5 FPS for the
+initial single-buffer renderer.
 
 ## Performance profiling
 
@@ -86,24 +90,29 @@ Build and upload `waveshare_amoled_143_screenshot`, then run:
 python tools/profile_performance.py --port COM21
 ```
 
-The script samples quiet on-demand counters and reports average FPS, render
-time, complete transfer-task time, and QSPI-only time. Measurements on this
-board:
+The script samples quiet on-demand counters and reports average FPS, complete
+render time, globe and overlay phases, transfer-task time, and QSPI-only time.
+Measurements on this board:
 
-| Configuration | Render | Transfer | FPS |
-|---|---:|---:|---:|
-| Original full 466×466, 4096 chunk, 40 MHz | 52.63 ms | 38.63 ms | 19.00 |
-| Packed 423×423, 4096 chunk, 40 MHz | 50.18 ms | 31.43 ms | 19.92 |
-| Packed, 8192 chunk, 40/60 MHz request | 50.24 ms | 30.85 ms | 19.90 |
-| Packed, 16384 chunk, 40 MHz | 50.63 ms | 31.48 ms | 19.74 |
-| Packed, 8192 chunk, 80 MHz, 1024×512 map | 49.23 ms | 22.22 ms | 20.31 |
-| Packed, 8192 chunk, 80 MHz, 512×256 map | 38.88 ms | 20.48 ms | 25.71 |
+| Configuration | Render | Globe | Overlay | Transfer | FPS |
+|---|---:|---:|---:|---:|---:|
+| 1024×512 front/back baseline | 49.31 ms | 46.86 ms | 2.45 ms | 22.20 ms | 20.27 |
+| + direct RGB565 color table | 46.89 ms | 44.44 ms | 2.45 ms | 22.51 ms | 21.32 |
+| + pointer loop, unrolled by two | 43.73 ms | 41.28 ms | 2.45 ms | 23.11 ms | 22.86 |
+| + dedicated packed 512×256 back layer | 41.05 ms | 38.60 ms | 2.45 ms | 21.71 ms | 24.35 |
+| + targeted `-O3` | 37.99 ms | 35.59 ms | 2.41 ms | 22.13 ms | 26.31 |
+| + hot loop in internal executable RAM | **36.91 ms** | **34.50 ms** | **2.41 ms** | **22.14 ms** | **27.08** |
 
 The 60 MHz request measured identically to 40 MHz, consistent with the ESP32
-SPI divider selecting the same effective clock. The 512×256 texture is retained
-as an optional `GLOBE_USE_HALF_TEXTURE=1` mode, but is not the release default:
-its coastlines are visibly more pixelated despite the large speed and flash
-savings.
+SPI divider selecting the same effective clock. A 512×256 front texture remains
+available as `GLOBE_USE_HALF_TEXTURE=1`, but it is not the release default
+because its coastlines are visibly more pixelated. The optimized release only
+reduces the intentionally blurred back layer, leaving the detailed front map
+unchanged.
+
+Rendering and QSPI transfer run concurrently on separate cores. Therefore their
+times overlap; final FPS is limited by the slower 36.91 ms render stage rather
+than the sum of render and transfer times.
 
 ## Capturing the framebuffer
 
@@ -129,7 +138,8 @@ The generated header is already included. To rebuild it:
 ```powershell
 python tools/generate_world_map.py --supersample 4
 python tools/generate_world_map.py --width 512 --height 256 --supersample 4 `
-  --output src/world_texture_512.h --preview world-texture-512-preview.png
+  --output src/world_texture_512.h --back-output src/world_back_512.h `
+  --preview world-texture-512-preview.png
 ```
 
 The script downloads pinned Natural Earth physical vector layers, filters lakes
