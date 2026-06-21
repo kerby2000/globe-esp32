@@ -138,30 +138,41 @@ def build_texture(
     rivers_data: dict,
     width: int,
     height: int,
+    supersample: int,
 ) -> tuple[bytes, Image.Image, Image.Image]:
-    land = Image.new("L", (width, height), 0)
-    coastline = Image.new("L", (width, height), 0)
-    lakes = Image.new("L", (width, height), 0)
-    rivers = Image.new("L", (width, height), 0)
+    work_width = width * supersample
+    work_height = height * supersample
+    line_width = max(1, supersample)
+    land = Image.new("L", (work_width, work_height), 0)
+    coastline = Image.new("L", (work_width, work_height), 0)
+    lakes = Image.new("L", (work_width, work_height), 0)
+    rivers = Image.new("L", (work_width, work_height), 0)
 
-    draw_land(land, land_data, width, height, 255)
-    draw_lines(coastline, coastline_data, width, height, 255, 1)
+    draw_land(land, land_data, work_width, work_height, 255)
+    draw_lines(
+        coastline,
+        coastline_data,
+        work_width,
+        work_height,
+        255,
+        line_width,
+    )
     draw_lines(
         lakes,
         lakes_data,
-        width,
-        height,
+        work_width,
+        work_height,
         230,
-        1,
+        line_width,
         lambda properties: float(properties.get("min_zoom", 99)) <= 2.0,
     )
     draw_lines(
         rivers,
         rivers_data,
-        width,
-        height,
+        work_width,
+        work_height,
         175,
-        1,
+        line_width,
         lambda properties: float(properties.get("min_zoom", 99)) <= 2.0,
     )
 
@@ -169,13 +180,24 @@ def build_texture(
     # byte per surface instead of checking four neighboring map pixels.
     front = scaled(land, 14, 255)
     front = ImageChops.lighter(
-        front, scaled(coastline.filter(ImageFilter.GaussianBlur(2.0)), 150, 255)
+        front,
+        scaled(
+            coastline.filter(ImageFilter.GaussianBlur(2.0 * supersample)),
+            150,
+            255,
+        ),
     )
     front = ImageChops.lighter(
-        front, scaled(lakes.filter(ImageFilter.GaussianBlur(1.6)), 115, 255)
+        front,
+        scaled(
+            lakes.filter(ImageFilter.GaussianBlur(1.6 * supersample)), 115, 255
+        ),
     )
     front = ImageChops.lighter(
-        front, scaled(rivers.filter(ImageFilter.GaussianBlur(1.3)), 80, 255)
+        front,
+        scaled(
+            rivers.filter(ImageFilter.GaussianBlur(1.3 * supersample)), 80, 255
+        ),
     )
     front = ImageChops.lighter(front, coastline)
     front = ImageChops.lighter(front, lakes)
@@ -185,10 +207,24 @@ def build_texture(
     # This creates the translucent blurred continents visible through the globe.
     physical = ImageChops.lighter(coastline, lakes)
     physical = ImageChops.lighter(physical, scaled(rivers, 3, 5))
-    back = scaled(land.filter(ImageFilter.GaussianBlur(2.5)), 35, 255)
-    back = ImageChops.lighter(
-        back, scaled(physical.filter(ImageFilter.GaussianBlur(5.0)), 155, 255)
+    back = scaled(
+        land.filter(ImageFilter.GaussianBlur(2.5 * supersample)), 35, 255
     )
+    back = ImageChops.lighter(
+        back,
+        scaled(
+            physical.filter(ImageFilter.GaussianBlur(5.0 * supersample)),
+            155,
+            255,
+        ),
+    )
+
+    # LANCZOS converts the high-resolution vector rasterization into fractional
+    # edge coverage at the final texture size. The 4-bit quantizer preserves
+    # those intermediate levels, so coastlines no longer staircase on-screen.
+    target_size = (width, height)
+    front = front.resize(target_size, Image.Resampling.LANCZOS)
+    back = back.resize(target_size, Image.Resampling.LANCZOS)
 
     front_values = front.load()
     back_values = back.load()
@@ -239,9 +275,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--supersample", type=int, default=4)
     parser.add_argument("--output", type=Path, default=Path("src/world_texture.h"))
     parser.add_argument("--preview", type=Path, default=Path("world-texture-preview.png"))
     args = parser.parse_args()
+    if args.supersample < 1:
+        parser.error("--supersample must be at least 1")
 
     data = {name: fetch_geojson(url) for name, url in SOURCES.items()}
     packed, front, back = build_texture(
@@ -251,6 +290,7 @@ def main() -> None:
         data["rivers"],
         args.width,
         args.height,
+        args.supersample,
     )
     write_header(args.output, packed, args.width, args.height)
 
@@ -268,6 +308,10 @@ def main() -> None:
     preview.save(args.preview)
     print(f"Wrote {args.output} ({len(packed)} packed texture bytes)")
     print(f"Wrote {args.preview}")
+    print(
+        f"Rasterized at {args.width * args.supersample}x"
+        f"{args.height * args.supersample}, downsampled with LANCZOS"
+    )
 
 
 if __name__ == "__main__":

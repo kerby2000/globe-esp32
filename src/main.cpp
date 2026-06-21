@@ -5,6 +5,7 @@
 #include <math.h>
 
 #include "font5x7.h"
+#include "ui_fonts.h"
 #include "world_texture.h"
 
 #ifndef GLOBE_ENABLE_SERIAL_STATS
@@ -39,7 +40,13 @@ constexpr int16_t kLutOriginX = kGlobeCenterX - kGlobeRadius;
 constexpr int16_t kLutOriginY = kGlobeCenterY - kGlobeRadius;
 
 constexpr uint32_t kUMask = 0x3FFUL;
-constexpr uint32_t kSixBitMask = 0x3FUL;
+constexpr uint32_t kShadeMask = 0x0FUL;
+constexpr uint32_t kCoverageMask = 0x03UL;
+constexpr uint32_t kFrameOffsetMask = 0x3FFFFUL;
+constexpr uint16_t kWeekdayStyleBase = 256;
+constexpr uint16_t kDateStyleBase = 272;
+constexpr uint16_t kOverlayStyleCount = 288;
+constexpr uint16_t kOverlayPixelCapacity = 16000;
 
 // 1024 texture texels per 18 seconds, represented as Q16.16 texels/ms.
 constexpr uint32_t kRotationStepQ16PerMs = 3728;
@@ -62,7 +69,12 @@ uint16_t sphereLeft[kLutDiameter];
 uint16_t sphereRight[kLutDiameter];
 uint16_t sphereV[kLutDiameter];
 
-uint16_t globePalette[64 * 16];
+uint16_t globePalette[4 * 16 * 16];
+uint16_t overlayColors[kOverlayStyleCount];
+uint8_t overlayAlphas[kOverlayStyleCount];
+uint32_t *overlayPixels = nullptr;
+uint16_t overlayPixelCount = 0;
+bool overlayOverflow = false;
 
 uint32_t rotationQ16 = 0;
 uint32_t previousFrameMs = 0;
@@ -152,20 +164,66 @@ uint8_t clampByte(int value) {
 }
 
 void buildColorPalettes() {
-  for (int shade = 0; shade < 64; ++shade) {
-    for (int intensity = 0; intensity < 16; ++intensity) {
-      // Low texture intensities create the transparent land haze. High values
-      // become cyan-white physical outlines. Shade already contains the sphere
-      // lighting and atmospheric rim, so the frame loop is only a table lookup.
-      const int highlight = max(0, intensity - 10);
-      const uint8_t red =
-          clampByte(intensity * 6 + highlight * 11 + shade / 7);
-      const uint8_t green =
-          clampByte(3 + intensity * 13 + shade / 2);
-      const uint8_t blue =
-          clampByte(7 + intensity * 16 + shade);
-      globePalette[(shade << 4) | intensity] = frame565(red, green, blue);
+  for (int coverage = 0; coverage < 4; ++coverage) {
+    for (int shade = 0; shade < 16; ++shade) {
+      for (int intensity = 0; intensity < 16; ++intensity) {
+        // Expand the compact four-bit shade back to the old six-bit range.
+        // Coverage is a two-bit area estimate for antialiasing the silhouette.
+        const int shade63 = (shade * 63 + 7) / 15;
+        const int highlight = max(0, intensity - 10);
+        const int red = intensity * 6 + highlight * 11 + shade63 / 7;
+        const int green = 3 + intensity * 13 + shade63 / 2;
+        const int blue = 7 + intensity * 16 + shade63;
+        globePalette[(coverage << 8) | (shade << 4) | intensity] =
+            frame565(clampByte(red * coverage / 3),
+                     clampByte(green * coverage / 3),
+                     clampByte(blue * coverage / 3));
+      }
     }
+  }
+
+  // Collapse foreground alpha and glow alpha into one source color/alpha pair.
+  // This preserves the soft clock halo while requiring only one RGB565 blend
+  // per framebuffer pixel.
+  constexpr uint8_t kTextRed = 238;
+  constexpr uint8_t kTextGreen = 255;
+  constexpr uint8_t kTextBlue = 255;
+  constexpr uint8_t kGlowRed = 0;
+  constexpr uint8_t kGlowGreen = 150;
+  constexpr uint8_t kGlowBlue = 178;
+  for (uint8_t alpha = 0; alpha < 16; ++alpha) {
+    for (uint8_t glow = 0; glow < 16; ++glow) {
+      const uint16_t glowWeight = glow * (15 - alpha);
+      const uint16_t textWeight = alpha * 15;
+      const uint16_t totalWeight = textWeight + glowWeight;
+      const uint8_t index = static_cast<uint8_t>((alpha << 4) | glow);
+      if (totalWeight == 0) {
+        overlayColors[index] = 0;
+        overlayAlphas[index] = 0;
+        continue;
+      }
+      const uint8_t red = static_cast<uint8_t>(
+          (kTextRed * textWeight + kGlowRed * glowWeight +
+           totalWeight / 2) /
+          totalWeight);
+      const uint8_t green = static_cast<uint8_t>(
+          (kTextGreen * textWeight + kGlowGreen * glowWeight +
+           totalWeight / 2) /
+          totalWeight);
+      const uint8_t blue = static_cast<uint8_t>(
+          (kTextBlue * textWeight + kGlowBlue * glowWeight +
+           totalWeight / 2) /
+          totalWeight);
+      overlayColors[index] = frame565(red, green, blue);
+      overlayAlphas[index] =
+          static_cast<uint8_t>((totalWeight * 255 + 112) / 225);
+    }
+  }
+  for (uint8_t alpha = 0; alpha < 16; ++alpha) {
+    overlayColors[kWeekdayStyleBase + alpha] = frame565(215, 255, 250);
+    overlayAlphas[kWeekdayStyleBase + alpha] = alpha * 17;
+    overlayColors[kDateStyleBase + alpha] = frame565(150, 215, 220);
+    overlayAlphas[kDateStyleBase + alpha] = alpha * 17;
   }
 }
 
@@ -178,32 +236,54 @@ void buildSphereLut() {
 
   for (int16_t localY = 0; localY < kLutDiameter; ++localY) {
     const int16_t dy = localY - kGlobeRadius;
-    const float ny = static_cast<float>(dy) / kGlobeRadius;
+    const float rawNy = static_cast<float>(dy) / kGlobeRadius;
+    const float ny = constrain(rawNy, -1.0f, 1.0f);
     const float latitude = asinf(-ny);
     sphereV[localY] = static_cast<uint16_t>(constrain(
         static_cast<int32_t>((0.5f - latitude / kPi) *
                              world_texture::kHeight),
         0, world_texture::kHeight - 1));
-    const float rowHalfWidth =
-        sqrtf(static_cast<float>(kGlobeRadius * kGlobeRadius - dy * dy));
-    sphereLeft[localY] =
-        static_cast<uint16_t>(ceilf(kGlobeRadius - rowHalfWidth));
-    sphereRight[localY] =
-        static_cast<uint16_t>(floorf(kGlobeRadius + rowHalfWidth));
+    sphereLeft[localY] = kLutDiameter;
+    sphereRight[localY] = 0;
 
     for (int16_t localX = 0; localX < kLutDiameter; ++localX) {
       const int16_t dx = localX - kGlobeRadius;
       const uint32_t lutIndex =
           static_cast<uint32_t>(localY) * kLutDiameter + localX;
-      const float nx = static_cast<float>(dx) / kGlobeRadius;
-      const float radiusSquared = nx * nx + ny * ny;
 
-      if (radiusSquared > 1.0f) {
+      // Four-by-four subpixel coverage is calculated once and packed into two
+      // LUT bits. This removes the stair-step circle edge without any runtime
+      // distance math or a separate mask fetch.
+      uint8_t coveredSamples = 0;
+      for (uint8_t sampleY = 0; sampleY < 4; ++sampleY) {
+        const float subY = dy + (sampleY + 0.5f) * 0.25f - 0.5f;
+        for (uint8_t sampleX = 0; sampleX < 4; ++sampleX) {
+          const float subX = dx + (sampleX + 0.5f) * 0.25f - 0.5f;
+          if (subX * subX + subY * subY <=
+              static_cast<float>(kGlobeRadius * kGlobeRadius)) {
+            ++coveredSamples;
+          }
+        }
+      }
+      if (coveredSamples == 0) {
         sphereLut[lutIndex] = 0;
         continue;
       }
+      sphereLeft[localY] = min<uint16_t>(sphereLeft[localY], localX);
+      sphereRight[localY] = max<uint16_t>(sphereRight[localY], localX);
+      const uint32_t coverage =
+          min<uint32_t>(3, (coveredSamples * 3U + 15U) / 16U);
 
-      const float nz = sqrtf(1.0f - radiusSquared);
+      float nx = static_cast<float>(dx) / kGlobeRadius;
+      float projectedNy = ny;
+      float radiusSquared = nx * nx + projectedNy * projectedNy;
+      if (radiusSquared > 1.0f) {
+        const float normalize = 0.9999f / sqrtf(radiusSquared);
+        nx *= normalize;
+        projectedNy *= normalize;
+        radiusSquared = nx * nx + projectedNy * projectedNy;
+      }
+      const float nz = sqrtf(max(0.0f, 1.0f - radiusSquared));
       const float longitude = atan2f(nx, nz);
 
       int32_t textureU = static_cast<int32_t>(
@@ -212,15 +292,40 @@ void buildSphereLut() {
 
       // A soft upper-left light and a brighter edge give the transparent globe
       // volume. They are collapsed into one six-bit palette coordinate.
-      float lightDot = nx * -0.32f + ny * -0.48f + nz * 0.82f;
+      float lightDot =
+          nx * -0.32f + projectedNy * -0.48f + nz * 0.82f;
       lightDot = constrain(lightDot, 0.0f, 1.0f);
       const float rim = (1.0f - nz) * (1.0f - nz);
-      const uint32_t shade = static_cast<uint32_t>(
-          constrain(3.0f + lightDot * 22.0f + rim * 38.0f, 0.0f, 63.0f));
+      const float shade63 =
+          constrain(3.0f + lightDot * 22.0f + rim * 38.0f, 0.0f, 63.0f);
+      const uint32_t shade =
+          static_cast<uint32_t>((shade63 * 15.0f + 31.5f) / 63.0f);
 
       sphereLut[lutIndex] = static_cast<uint16_t>(
           (static_cast<uint32_t>(textureU) & kUMask) |
-          ((shade & kSixBitMask) << 10));
+          ((shade & kShadeMask) << 10) |
+          ((coverage & kCoverageMask) << 14));
+    }
+  }
+}
+
+void initializeFrameBackground(uint16_t *buffer) {
+  // The exterior halo is static, so bake it into both reusable framebuffers.
+  // The rotating sphere overwrites its own pixels each frame.
+  for (int16_t y = 0; y < kDisplayHeight; ++y) {
+    for (int16_t x = 0; x < kDisplayWidth; ++x) {
+      const float dx = x - kGlobeCenterX;
+      const float dy = y - kGlobeCenterY;
+      const float exteriorDistance =
+          sqrtf(dx * dx + dy * dy) - kGlobeRadius;
+      uint16_t color = 0;
+      if (exteriorDistance >= 0.0f && exteriorDistance < 10.0f) {
+        const float strength =
+            expf(-(exteriorDistance * exteriorDistance) / 14.0f);
+        color = frame565(0, static_cast<uint8_t>(18.0f * strength),
+                         static_cast<uint8_t>(34.0f * strength));
+      }
+      buffer[static_cast<uint32_t>(y) * kDisplayWidth + x] = color;
     }
   }
 }
@@ -263,10 +368,174 @@ void drawCenteredText(const char *text, int16_t y, uint8_t scale,
   drawText(text, x, y, scale, color);
 }
 
+uint8_t packedAlpha(const uint8_t *data, uint32_t pixelIndex) {
+  const uint8_t packed = pgm_read_byte(data + (pixelIndex >> 1));
+  return (pixelIndex & 1U) ? (packed & 0x0FU) : (packed >> 4);
+}
+
+bool findGlyph(const ui_fonts::Font &font, char character,
+               ui_fonts::Glyph &glyph) {
+  for (uint8_t index = 0; index < font.glyphCount; ++index) {
+    memcpy_P(&glyph, font.glyphs + index, sizeof(glyph));
+    if (glyph.character == character) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int16_t alphaTextWidth(const ui_fonts::Font &font, const char *text) {
+  int16_t width = 0;
+  ui_fonts::Glyph glyph;
+  for (const char *cursor = text; *cursor != '\0'; ++cursor) {
+    if (findGlyph(font, *cursor, glyph)) {
+      width += glyph.advance;
+    }
+  }
+  return width;
+}
+
+void blendFramePixel(uint16_t *destination, uint16_t sourceFrame,
+                     uint8_t alpha) {
+  if (alpha == 0) {
+    return;
+  }
+  if (alpha == 255) {
+    *destination = sourceFrame;
+    return;
+  }
+
+  const uint16_t source = __builtin_bswap16(sourceFrame);
+  const uint16_t background = __builtin_bswap16(*destination);
+  const uint32_t alpha32 = (alpha + 4U) >> 3;
+  const uint32_t inverseAlpha32 = 32U - alpha32;
+  const uint16_t redBlue = static_cast<uint16_t>(
+      (((source & 0xF81FU) * alpha32 +
+        (background & 0xF81FU) * inverseAlpha32) >>
+       5) &
+      0xF81FU);
+  const uint16_t green = static_cast<uint16_t>(
+      (((source & 0x07E0U) * alpha32 +
+        (background & 0x07E0U) * inverseAlpha32) >>
+       5) &
+      0x07E0U);
+  *destination = __builtin_bswap16(redBlue | green);
+}
+
+void appendOverlayPixel(int16_t x, int16_t y, uint16_t styleIndex) {
+  if (x < 0 || x >= kDisplayWidth || y < 0 || y >= kDisplayHeight ||
+      overlayAlphas[styleIndex] == 0) {
+    return;
+  }
+  // The glow-only 1/15 fringe is nearly invisible on black but accounts for
+  // thousands of blends. Keep glow levels 2..15 and every glyph alpha level.
+  if (styleIndex < kWeekdayStyleBase && (styleIndex >> 4) == 0 &&
+      (styleIndex & 0x0F) == 1) {
+    return;
+  }
+  if (overlayPixelCount >= kOverlayPixelCapacity) {
+    overlayOverflow = true;
+    return;
+  }
+  const uint32_t frameOffset =
+      static_cast<uint32_t>(y) * kDisplayWidth + x;
+  overlayPixels[overlayPixelCount++] =
+      frameOffset | (static_cast<uint32_t>(styleIndex) << 18);
+}
+
+void appendAlphaText(const ui_fonts::Font &font, const char *text, int16_t x,
+                     int16_t lineY, uint16_t styleBase) {
+  ui_fonts::Glyph glyph;
+  for (const char *cursor = text; *cursor != '\0'; ++cursor) {
+    if (!findGlyph(font, *cursor, glyph)) {
+      continue;
+    }
+    const int16_t glyphX = x + glyph.xOffset;
+    const int16_t glyphY = lineY + glyph.yOffset;
+    for (uint8_t py = 0; py < glyph.height; ++py) {
+      const int16_t screenY = glyphY + py;
+      if (screenY < 0 || screenY >= kDisplayHeight) {
+        continue;
+      }
+      for (uint8_t px = 0; px < glyph.width; ++px) {
+        const int16_t screenX = glyphX + px;
+        if (screenX < 0 || screenX >= kDisplayWidth) {
+          continue;
+        }
+        const uint32_t pixelIndex =
+            static_cast<uint32_t>(py) * glyph.width + px;
+        const uint8_t alpha =
+            packedAlpha(font.alpha + glyph.alphaOffset, pixelIndex);
+        appendOverlayPixel(screenX, screenY, styleBase + alpha);
+      }
+    }
+    x += glyph.advance;
+  }
+}
+
+void appendGlowingTime(const char *text, int16_t x, int16_t lineY) {
+  const ui_fonts::Font &font = ui_fonts::kTime;
+  ui_fonts::Glyph glyph;
+  for (const char *cursor = text; *cursor != '\0'; ++cursor) {
+    if (!findGlyph(font, *cursor, glyph)) {
+      continue;
+    }
+    const int16_t glyphX = x + glyph.xOffset;
+    const int16_t glyphY = lineY + glyph.yOffset;
+    for (uint8_t py = 0; py < glyph.height; ++py) {
+      const int16_t screenY = glyphY + py;
+      if (screenY < 0 || screenY >= kDisplayHeight) {
+        continue;
+      }
+      for (uint8_t px = 0; px < glyph.width; ++px) {
+        const int16_t screenX = glyphX + px;
+        if (screenX < 0 || screenX >= kDisplayWidth) {
+          continue;
+        }
+        const uint32_t pixelIndex =
+            static_cast<uint32_t>(py) * glyph.width + px;
+        const uint8_t alpha =
+            packedAlpha(font.alpha + glyph.alphaOffset, pixelIndex);
+        const uint8_t glow =
+            packedAlpha(font.glow + glyph.glowOffset, pixelIndex);
+        const uint8_t compositeIndex =
+            static_cast<uint8_t>((alpha << 4) | glow);
+        appendOverlayPixel(screenX, screenY, compositeIndex);
+      }
+    }
+    x += glyph.advance;
+  }
+}
+
+void appendCenteredAlphaText(const ui_fonts::Font &font, const char *text,
+                             int16_t lineY, uint16_t styleBase) {
+  appendAlphaText(font, text,
+                  (kDisplayWidth - alphaTextWidth(font, text)) / 2, lineY,
+                  styleBase);
+}
+
+void buildOverlayPixels() {
+  // Font decoding and transparent-pixel rejection happen only when overlay
+  // text changes. A real clock can call this once per minute instead of
+  // walking packed glyph bitmaps during every globe frame.
+  overlayPixelCount = 0;
+  overlayOverflow = false;
+  appendCenteredAlphaText(ui_fonts::kWeekday, "SATURDAY", 159,
+                          kWeekdayStyleBase);
+  const char *time = "10:43";
+  appendGlowingTime(
+      time, (kDisplayWidth - alphaTextWidth(ui_fonts::kTime, time)) / 2, 177);
+  appendCenteredAlphaText(ui_fonts::kDate, "20 JUN 2026", 296,
+                          kDateStyleBase);
+}
+
 void drawOverlay() {
-  drawCenteredText("SATURDAY", 164, 3, frame565(205, 255, 250));
-  drawCenteredText("10:43", 203, 8, frame565(230, 255, 255));
-  drawCenteredText("20 JUN 2026", 278, 2, frame565(145, 215, 220));
+  for (uint16_t index = 0; index < overlayPixelCount; ++index) {
+    const uint32_t packed = overlayPixels[index];
+    const uint16_t styleIndex = packed >> 18;
+    blendFramePixel(frameBuffer + (packed & kFrameOffsetMask),
+                    overlayColors[styleIndex], overlayAlphas[styleIndex]);
+  }
 
 #if GLOBE_ENABLE_SERIAL_STATS
   // Keep FPS visible only in the profiling build.
@@ -388,9 +657,11 @@ void renderFrame(uint16_t rotationTexels) {
           static_cast<uint8_t>((backIntensity * 3 + 2) >> 2);
       const uint8_t intensity =
           min<uint8_t>(15, frontIntensity + backContribution);
-      const uint8_t shade = sample >> 10;
+      const uint8_t shade = (sample >> 10) & kShadeMask;
+      const uint8_t coverage = sample >> 14;
 
-      destination[localX] = globePalette[(shade << 4) | intensity];
+      destination[localX] =
+          globePalette[(coverage << 8) | (shade << 4) | intensity];
     }
   }
 
@@ -466,16 +737,23 @@ void setup() {
   sphereLut = static_cast<uint16_t *>(heap_caps_malloc(
       static_cast<size_t>(kLutDiameter) * kLutDiameter * sizeof(uint16_t),
       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  overlayPixels = static_cast<uint32_t *>(heap_caps_malloc(
+      static_cast<size_t>(kOverlayPixelCapacity) * sizeof(uint32_t),
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
   if (frameBuffers[0] == nullptr || frameBuffers[1] == nullptr ||
-      sphereLut == nullptr) {
+      sphereLut == nullptr || overlayPixels == nullptr) {
     haltWithMessage("PSRAM ALLOCATION FAILED");
   }
-  memset(frameBuffers[0], 0, frameByteCount);
-  memset(frameBuffers[1], 0, frameByteCount);
+  initializeFrameBackground(frameBuffers[0]);
+  initializeFrameBackground(frameBuffers[1]);
 
   buildColorPalettes();
   buildSphereLut();
+  buildOverlayPixels();
+  if (overlayOverflow) {
+    haltWithMessage("OVERLAY PIXEL CAPACITY");
+  }
 
   freeFrameQueue = xQueueCreate(2, sizeof(uint16_t *));
   readyFrameQueue = xQueueCreate(2, sizeof(uint16_t *));
@@ -497,6 +775,8 @@ void setup() {
   Serial.printf("Sphere LUT:   %u bytes\n",
                 kLutDiameter * kLutDiameter * sizeof(uint16_t));
   Serial.printf("World texture:%u bytes\n", world_texture::kByteCount);
+  Serial.printf("Overlay pixels:%u (%u bytes)\n", overlayPixelCount,
+                overlayPixelCount * sizeof(uint32_t));
   Serial.printf("Free PSRAM:   %u bytes\n", ESP.getFreePsram());
   fpsWindowStartMs = previousFrameMs;
 #endif
