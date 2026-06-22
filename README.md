@@ -45,14 +45,15 @@ QSPI-only timings.
 
 ## Rendering design
 
-- `src/world_texture.h` is a packed 1024×512 intensity texture generated from
-  Natural Earth 1:50m land, coastlines, major lakes, and major rivers. It has no
-  political borders.
+- `src/world_front_1024.h` stores the Natural Earth 1:50m land, coastlines,
+  major lakes, and major rivers as two four-bit front-surface texels per byte.
+  It has no political borders and is pixel-equivalent to the former high
+  nibbles in `src/world_texture.h`.
 - Natural Earth vectors are rasterized at 4096×2048 and reduced with LANCZOS,
   preserving fractional coastline coverage before the 4-bit quantization.
-- The detailed front surface remains at 1024×512. A separate 512×256 texture
-  packs two four-bit blurred back-surface samples per byte, producing the
-  transparent-globe underlay with lower PSRAM/cache traffic.
+- The detailed front surface remains at 1024×512 but now occupies 256 KB
+  instead of 512 KB. A separate 512×256 texture packs two four-bit blurred
+  back-surface samples per byte, producing the transparent-globe underlay.
 - At startup, `buildSphereLut()` projects globe pixels to longitude and stores
   longitude, four-bit shading, and two-bit subpixel rim coverage in a compact
   16-bit PSRAM LUT. Latitude is shared by each scanline.
@@ -60,12 +61,16 @@ QSPI-only timings.
   setup-time coverage estimate smooths the sphere silhouette.
 - The expensive `sqrt`, `asin`, and `atan2` calls run only once during setup.
 - Each frame uses integer texture samples and directly indexes a 32 KB
-  precomputed RGB565 color table. The hot scanline loop is unrolled by two,
+  precomputed RGB565 color table. The hot scanline loop is unrolled by eight,
   compiled with targeted `-O3`, and placed in internal executable RAM.
 - The clock, weekday, and date use offline-generated four-bit alpha glyphs.
   The large time includes a baked soft cyan glow. Transparent glyph pixels are
   rejected at setup and the remaining pixels are stored as a compact command
   list, ready to rebuild when a real clock value changes.
+- Exact RGB565 overlay blend tables are generated during setup. Fixed-overlay
+  composition runs on the display core immediately before QSPI transfer,
+  overlapping it with the next globe render instead of extending the critical
+  render stage.
 - Frame rendering contains no floating-point math.
 - Two PSRAM framebuffers form a producer/consumer pipeline: core 1 renders while
   core 0 transfers the previous frame over QSPI.
@@ -75,12 +80,12 @@ QSPI-only timings.
 - RGB565 is stored in panel byte order so QSPI can send framebuffer bytes
   directly without a per-pixel byte-swap pass.
 
-Each packed framebuffer and the sphere LUT use about 358 KB. The dedicated
-back-surface texture uses 64 KB of flash, while the direct color table uses
-32 KB of internal RAM. The release build uses 8192-pixel QSPI chunks and an
-80 MHz requested bus clock. The measured rate on the connected target board is
-a stable 27.08 FPS with the antialiased overlay, compared with 5 FPS for the
-initial single-buffer renderer.
+Each packed framebuffer and the sphere LUT use about 358 KB. The front and back
+textures use 256 KB and 64 KB of flash. The direct globe color table uses 32 KB
+of internal RAM and the exact overlay component tables use 36 KB. The release
+build uses 8192-pixel QSPI chunks and an 80 MHz requested bus clock. The
+measured rate on the connected target board is a stable 30.56 FPS with the
+antialiased overlay, compared with 5 FPS for the initial single-buffer renderer.
 
 ## Performance profiling
 
@@ -90,9 +95,9 @@ Build and upload `waveshare_amoled_143_screenshot`, then run:
 python tools/profile_performance.py --port COM21
 ```
 
-The script samples quiet on-demand counters and reports average FPS, complete
-render time, globe and overlay phases, transfer-task time, and QSPI-only time.
-Measurements on this board:
+The script samples quiet on-demand counters and reports average FPS, globe
+render time, display-core overlay time, complete display-task time, and
+QSPI-only time. Measurements on this board:
 
 | Configuration | Render | Globe | Overlay | Transfer | FPS |
 |---|---:|---:|---:|---:|---:|
@@ -101,7 +106,8 @@ Measurements on this board:
 | + pointer loop, unrolled by two | 43.73 ms | 41.28 ms | 2.45 ms | 23.11 ms | 22.86 |
 | + dedicated packed 512×256 back layer | 41.05 ms | 38.60 ms | 2.45 ms | 21.71 ms | 24.35 |
 | + targeted `-O3` | 37.99 ms | 35.59 ms | 2.41 ms | 22.13 ms | 26.31 |
-| + hot loop in internal executable RAM | **36.91 ms** | **34.50 ms** | **2.41 ms** | **22.14 ms** | **27.08** |
+| + hot loop in internal executable RAM (v0.4) | 36.91 ms | 34.50 ms | 2.41 ms | 22.14 ms | 27.08 |
+| Packed front, back-phase reuse, overlay on display core, 8× unroll | **32.71 ms** | **32.71 ms** | **2.32 ms** | **23.17 ms** | **30.56** |
 
 The 60 MHz request measured identically to 40 MHz, consistent with the ESP32
 SPI divider selecting the same effective clock. A 512×256 front texture remains
@@ -110,9 +116,10 @@ because its coastlines are visibly more pixelated. The optimized release only
 reduces the intentionally blurred back layer, leaving the detailed front map
 unchanged.
 
-Rendering and QSPI transfer run concurrently on separate cores. Therefore their
-times overlap; final FPS is limited by the slower 36.91 ms render stage rather
-than the sum of render and transfer times.
+Rendering and display work run concurrently on separate cores. The reported
+23.17 ms display-task time includes the 2.32 ms overlay phase and the 20.85 ms
+QSPI phase. Final FPS is limited by the 32.71 ms globe render stage rather than
+the sum of render and display-task times.
 
 ## Capturing the framebuffer
 
@@ -136,7 +143,9 @@ moving region rather than the static 466×466 panel background.
 The generated header is already included. To rebuild it:
 
 ```powershell
-python tools/generate_world_map.py --supersample 4
+python tools/generate_world_map.py --width 1024 --height 512 --supersample 4 `
+  --output src/world_texture.h --front-output src/world_front_1024.h `
+  --preview world-texture-preview.png
 python tools/generate_world_map.py --width 512 --height 256 --supersample 4 `
   --output src/world_texture_512.h --back-output src/world_back_512.h `
   --preview world-texture-512-preview.png
