@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
+#include <Wire.h>
 #include <esp_heap_caps.h>
 #include <freertos/queue.h>
 #include <math.h>
@@ -40,6 +41,10 @@ namespace globe_texture = world_texture;
 
 #ifndef GLOBE_ENABLE_SCREENSHOT
 #define GLOBE_ENABLE_SCREENSHOT 0
+#endif
+
+#ifndef GLOBE_ENABLE_TOUCH
+#define GLOBE_ENABLE_TOUCH 1
 #endif
 
 #ifndef GLOBE_DISPLAY_BUS_HZ
@@ -110,6 +115,25 @@ constexpr int8_t kLcdReset = 21;
 constexpr int8_t kAmoledEnable = 42;
 constexpr uint8_t kSh8601Id = 0x86;
 
+#if GLOBE_ENABLE_TOUCH
+// FT3168 shares this I2C bus with the optional IMU and RTC.
+constexpr int8_t kTouchSda = 47;
+constexpr int8_t kTouchScl = 48;
+constexpr uint8_t kTouchAddress = 0x38;
+constexpr uint8_t kTouchModeRegister = 0x00;
+constexpr uint8_t kTouchPointCountRegister = 0x02;
+constexpr uint8_t kTouchFirstPointRegister = 0x03;
+constexpr uint32_t kTouchI2cHz = 300000;
+constexpr uint16_t kTouchStartupTimeoutMs = 250;
+constexpr uint16_t kTouchStartupRetryMs = 10;
+constexpr uint16_t kTouchRecoveryIntervalMs = 1000;
+constexpr uint16_t kTapMaximumMs = 250;
+constexpr uint16_t kDoubleTapMaximumGapMs = 350;
+constexpr uint16_t kLongPressMs = 700;
+constexpr int16_t kGestureMoveThreshold = 10;
+constexpr int16_t kDoubleTapPositionThreshold = 48;
+#endif
+
 constexpr int16_t kGlobeCenterX = kDisplayWidth / 2;
 constexpr int16_t kGlobeCenterY = kDisplayHeight / 2;
 constexpr int16_t kGlobeRadius = 211;
@@ -150,8 +174,17 @@ constexpr uint16_t kOverlayStyleCount = 288;
 constexpr uint16_t kOverlayPixelCapacity = 16000;
 
 // One full rotation per 18 seconds, represented as Q16.16 texels/ms.
-constexpr uint32_t kRotationStepQ16PerMs =
+constexpr int32_t kAutoRotationVelocityQ16PerMs =
     (static_cast<uint32_t>(globe_texture::kWidth) << 16) / 18000U;
+#if GLOBE_ENABLE_TOUCH
+// Dragging across the display rotates the texture by one complete revolution.
+constexpr int32_t kDragSensitivityQ16PerPixel =
+    (static_cast<uint32_t>(globe_texture::kWidth) << 16) / kDisplayWidth;
+// Bound pathological touch samples to a roughly 1.2-second minimum revolution.
+constexpr int32_t kMaximumInertiaVelocityQ16PerMs =
+    (static_cast<uint32_t>(globe_texture::kWidth) << 16) / 1200U;
+constexpr uint16_t kInertiaReturnToAutoMs = 900;
+#endif
 
 Arduino_DataBus *displayBus = new Arduino_ESP32QSPI(
     kLcdCs, kLcdClock, kLcdData0, kLcdData1, kLcdData2, kLcdData3);
@@ -191,6 +224,31 @@ bool overlayOverflow = false;
 uint32_t rotationQ16 = 0;
 uint32_t previousFrameMs = 0;
 
+#if GLOBE_ENABLE_TOUCH
+struct TouchInteractionState {
+  bool available = false;
+  bool down = false;
+  bool moved = false;
+  bool dragging = false;
+  bool longPressHandled = false;
+  bool previousTapValid = false;
+  int16_t startX = 0;
+  int16_t startY = 0;
+  int16_t lastX = 0;
+  int16_t lastY = 0;
+  int16_t previousTapX = 0;
+  int16_t previousTapY = 0;
+  uint32_t downMs = 0;
+  uint32_t lastSampleMs = 0;
+  uint32_t previousTapMs = 0;
+  uint32_t lastRecoveryAttemptMs = 0;
+  int32_t dragVelocityQ16PerMs = 0;
+  int32_t freeVelocityQ16PerMs = kAutoRotationVelocityQ16PerMs;
+};
+
+TouchInteractionState touchState;
+#endif
+
 #if GLOBE_ENABLE_SERIAL_STATS
 uint32_t fpsWindowStartMs = 0;
 uint16_t fpsWindowFrames = 0;
@@ -211,6 +269,226 @@ volatile uint32_t profileQspiMicros = 0;
 
 QueueHandle_t freeFrameQueue = nullptr;
 QueueHandle_t readyFrameQueue = nullptr;
+
+#if GLOBE_ENABLE_TOUCH
+bool readTouchRegisters(uint8_t reg, uint8_t *data, uint8_t length) {
+  Wire.beginTransmission(kTouchAddress);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom(kTouchAddress, length) != length) {
+    while (Wire.available()) {
+      Wire.read();
+    }
+    return false;
+  }
+  for (uint8_t index = 0; index < length; ++index) {
+    data[index] = static_cast<uint8_t>(Wire.read());
+  }
+  return true;
+}
+
+bool configureTouchController() {
+  // Match Waveshare's driver: register 0 selects normal operating mode.
+  Wire.beginTransmission(kTouchAddress);
+  Wire.write(kTouchModeRegister);
+  Wire.write(static_cast<uint8_t>(0x00));
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+
+  uint8_t pointCount = 0;
+  return readTouchRegisters(kTouchPointCountRegister, &pointCount, 1);
+}
+
+bool initializeTouch() {
+  if (!Wire.begin(kTouchSda, kTouchScl, kTouchI2cHz)) {
+    return false;
+  }
+  Wire.setTimeOut(20);
+
+  // FT3168 needs time after power-up before it starts acknowledging I2C.
+  // The old one-shot probe happened to work in debug builds because their
+  // serial startup delay was 100 ms, but failed in the faster release build.
+  const uint32_t startMs = millis();
+  do {
+    if (configureTouchController()) {
+      return true;
+    }
+    delay(kTouchStartupRetryMs);
+  } while (millis() - startMs < kTouchStartupTimeoutMs);
+  return false;
+}
+
+bool readTouchPoint(int16_t &x, int16_t &y) {
+  uint8_t pointCount = 0;
+  if (!readTouchRegisters(kTouchPointCountRegister, &pointCount, 1) ||
+      (pointCount & 0x0F) == 0) {
+    return false;
+  }
+
+  uint8_t point[4];
+  if (!readTouchRegisters(kTouchFirstPointRegister, point, sizeof(point))) {
+    return false;
+  }
+
+  x = static_cast<int16_t>(((point[0] & 0x0F) << 8) | point[1]);
+  y = static_cast<int16_t>(((point[2] & 0x0F) << 8) | point[3]);
+  x = constrain(x, 0, kDisplayWidth - 1);
+  y = constrain(y, 0, kDisplayHeight - 1);
+  return true;
+}
+
+void handleLongPress() {
+  // Gesture hook for a future settings/speed-control screen. Keeping this as a
+  // hook avoids adding dynamic UI work to the optimized render pipeline.
+#if GLOBE_ENABLE_SERIAL_STATS
+  Serial.println("Touch: long press");
+#endif
+}
+
+void resetGlobeView() {
+  rotationQ16 = 0;
+  touchState.freeVelocityQ16PerMs = kAutoRotationVelocityQ16PerMs;
+  touchState.dragVelocityQ16PerMs = 0;
+#if GLOBE_ENABLE_SERIAL_STATS
+  Serial.println("Touch: default view");
+#endif
+}
+
+void updateTouchInteraction(uint32_t now, uint32_t elapsedMs) {
+  if (!touchState.available &&
+      now - touchState.lastRecoveryAttemptMs >= kTouchRecoveryIntervalMs) {
+    touchState.lastRecoveryAttemptMs = now;
+    touchState.available = configureTouchController();
+#if GLOBE_ENABLE_SERIAL_STATS
+    if (touchState.available) {
+      Serial.println("FT3168 touch: recovered");
+    }
+#endif
+  }
+
+  int16_t x = 0;
+  int16_t y = 0;
+  const bool touched = touchState.available && readTouchPoint(x, y);
+
+  if (touched) {
+    if (!touchState.down) {
+      touchState.down = true;
+      touchState.moved = false;
+      touchState.dragging = false;
+      touchState.longPressHandled = false;
+      touchState.startX = x;
+      touchState.startY = y;
+      touchState.lastX = x;
+      touchState.lastY = y;
+      touchState.downMs = now;
+      touchState.lastSampleMs = now;
+      touchState.dragVelocityQ16PerMs = 0;
+#if GLOBE_ENABLE_SERIAL_STATS
+      Serial.printf("Touch: down %d,%d\n", x, y);
+#endif
+      return;
+    }
+
+    const int16_t totalX = x - touchState.startX;
+    const int16_t totalY = y - touchState.startY;
+    if (abs(totalX) > kGestureMoveThreshold ||
+        abs(totalY) > kGestureMoveThreshold) {
+      touchState.moved = true;
+    }
+    if (abs(totalX) > kGestureMoveThreshold) {
+      touchState.dragging = true;
+    }
+
+    const uint32_t sampleElapsedMs = max<uint32_t>(1, now - touchState.lastSampleMs);
+    const int16_t deltaX = x - touchState.lastX;
+    if (touchState.dragging && deltaX != 0) {
+      const int32_t rotationDeltaQ16 =
+          static_cast<int32_t>(deltaX) * kDragSensitivityQ16PerPixel;
+      rotationQ16 += static_cast<uint32_t>(rotationDeltaQ16);
+
+      int32_t sampleVelocity = rotationDeltaQ16 /
+                               static_cast<int32_t>(sampleElapsedMs);
+      sampleVelocity =
+          constrain(sampleVelocity, -kMaximumInertiaVelocityQ16PerMs,
+                    kMaximumInertiaVelocityQ16PerMs);
+      touchState.dragVelocityQ16PerMs =
+          (touchState.dragVelocityQ16PerMs * 2 + sampleVelocity) / 3;
+    } else {
+      // A stationary hold should not preserve an old fast flick sample.
+      touchState.dragVelocityQ16PerMs =
+          (touchState.dragVelocityQ16PerMs * 3) / 4;
+    }
+
+    if (!touchState.moved && !touchState.longPressHandled &&
+        now - touchState.downMs >= kLongPressMs) {
+      touchState.longPressHandled = true;
+      touchState.previousTapValid = false;
+      handleLongPress();
+    }
+
+    touchState.lastX = x;
+    touchState.lastY = y;
+    touchState.lastSampleMs = now;
+    return;
+  }
+
+  if (touchState.down) {
+    const uint32_t pressDurationMs = now - touchState.downMs;
+    if (touchState.dragging) {
+      touchState.freeVelocityQ16PerMs = constrain(
+          touchState.dragVelocityQ16PerMs,
+          -kMaximumInertiaVelocityQ16PerMs,
+          kMaximumInertiaVelocityQ16PerMs);
+      touchState.previousTapValid = false;
+    } else if (!touchState.moved && !touchState.longPressHandled &&
+               pressDurationMs <= kTapMaximumMs) {
+      const bool nearby =
+          abs(touchState.startX - touchState.previousTapX) <=
+              kDoubleTapPositionThreshold &&
+          abs(touchState.startY - touchState.previousTapY) <=
+              kDoubleTapPositionThreshold;
+      if (touchState.previousTapValid && nearby &&
+          now - touchState.previousTapMs <= kDoubleTapMaximumGapMs) {
+        resetGlobeView();
+        touchState.previousTapValid = false;
+      } else {
+        touchState.previousTapValid = true;
+        touchState.previousTapMs = now;
+        touchState.previousTapX = touchState.startX;
+        touchState.previousTapY = touchState.startY;
+        touchState.freeVelocityQ16PerMs = kAutoRotationVelocityQ16PerMs;
+      }
+    } else {
+      touchState.previousTapValid = false;
+      touchState.freeVelocityQ16PerMs = kAutoRotationVelocityQ16PerMs;
+    }
+#if GLOBE_ENABLE_SERIAL_STATS
+    Serial.printf("Touch: up %d,%d%s\n", touchState.lastX, touchState.lastY,
+                  touchState.dragging ? " drag" : "");
+#endif
+    touchState.down = false;
+  }
+
+  if (touchState.previousTapValid &&
+      now - touchState.previousTapMs > kDoubleTapMaximumGapMs) {
+    touchState.previousTapValid = false;
+  }
+
+  // Preserve flick direction and speed after release, then smoothly converge
+  // back to the normal automatic rotation instead of stopping abruptly.
+  rotationQ16 += static_cast<uint32_t>(
+      touchState.freeVelocityQ16PerMs * static_cast<int32_t>(elapsedMs));
+  const int32_t velocityDifference =
+      kAutoRotationVelocityQ16PerMs - touchState.freeVelocityQ16PerMs;
+  touchState.freeVelocityQ16PerMs +=
+      velocityDifference * static_cast<int32_t>(elapsedMs) /
+      kInertiaReturnToAutoMs;
+}
+#endif
 
 void bitBangWriteByte(uint8_t value) {
   for (uint8_t bit = 0; bit < 8; ++bit) {
@@ -290,13 +568,16 @@ void buildColorPalettes() {
           static_cast<uint16_t>((coverage << 4) | shade);
       for (int frontIntensity = 0; frontIntensity < 16; ++frontIntensity) {
         for (int backIntensity = 0; backIntensity < 16; ++backIntensity) {
-          const int backContribution = (backIntensity * 3 + 2) >> 2;
-          const int intensity =
-              min(15, frontIntensity + backContribution);
-          const int highlight = max(0, intensity - 10);
-          const int red = intensity * 6 + highlight * 11 + shade63 / 7;
-          const int green = 3 + intensity * 13 + shade63 / 2;
-          const int blue = 7 + intensity * 16 + shade63;
+          // Keep the detailed front geography neutral-white while adding the
+          // far hemisphere as a softer cyan emission. Treating both channels
+          // as one intensity made back fog look like dark solid terrain.
+          const int highlight = max(0, frontIntensity - 10);
+          const int red = frontIntensity * 6 + highlight * 11 +
+                          backIntensity * 4 + shade63 / 7;
+          const int green =
+              3 + frontIntensity * 13 + backIntensity * 10 + shade63 / 2;
+          const int blue =
+              7 + frontIntensity * 16 + backIntensity * 9 + shade63;
           const uint16_t textureIndex =
               static_cast<uint16_t>((frontIntensity << 4) | backIntensity);
           globeColorTable[(surfaceIndex << 8) | textureIndex] =
@@ -421,8 +702,7 @@ void buildSphereLut() {
           static_cast<uint32_t>(localY) * kLutDiameter + localX;
 
       // Four-by-four subpixel coverage is calculated once and packed into two
-      // LUT bits. This removes the stair-step circle edge without any runtime
-      // distance math or a separate mask fetch.
+      // LUT bits. This removes circle stair-steps without a broad rim fade.
       uint8_t coveredSamples = 0;
       for (uint8_t sampleY = 0; sampleY < 4; ++sampleY) {
         const float subY = dy + (sampleY + 0.5f) * 0.25f - 0.5f;
@@ -459,7 +739,7 @@ void buildSphereLut() {
           (longitude / kTwoPi + 0.5f) * globe_texture::kWidth);
       textureU &= globe_texture::kWidth - 1;
 
-      // A soft upper-left light and a brighter edge give the transparent globe
+      // A soft upper-left light and brighter edge give the transparent globe
       // volume. They are collapsed into one six-bit palette coordinate.
       float lightDot =
           nx * -0.32f + projectedNy * -0.48f + nz * 0.82f;
@@ -968,19 +1248,22 @@ GLOBE_RENDER_MEM GLOBE_RENDER_OPT void renderGlobe(uint16_t rotationTexels) {
 #else
     const uint8_t *__restrict__ backTextureRow = textureRow;
 #endif
+    const uint16_t left = sphereLeft[localY];
+    const uint16_t right = sphereRight[localY];
+    if (left > right) {
+      continue;
+    }
 
 #if GLOBE_RENDER_UNROLL == 0
-    for (uint16_t localX = sphereLeft[localY];
-         localX <= sphereRight[localY]; ++localX) {
+    for (uint16_t localX = left; localX <= right; ++localX) {
       destination[localX] =
           sampleGlobeColor(lutRow[localX], textureRow, backTextureRow,
                            rotationTexels, backPhase);
     }
 #else
-    const uint16_t left = sphereLeft[localY];
     uint16_t *__restrict__ dst = destination + left;
     const uint16_t *__restrict__ lut = lutRow + left;
-    uint16_t count = sphereRight[localY] - left + 1;
+    uint16_t count = right - left + 1;
 #if GLOBE_RENDER_UNROLL == 8
     while (count >= 8) {
       const uint16_t sample0 = *lut++;
@@ -1089,7 +1372,6 @@ void renderFrame(uint16_t rotationTexels) {
 void setup() {
 #if GLOBE_ENABLE_SERIAL_STATS || GLOBE_ENABLE_SCREENSHOT
   Serial.begin(115200);
-  delay(100);
 #endif
 
 #if GLOBE_ENABLE_SERIAL_STATS
@@ -1099,6 +1381,16 @@ void setup() {
   pinMode(kAmoledEnable, OUTPUT);
   digitalWrite(kAmoledEnable, HIGH);
   delay(20);
+
+#if GLOBE_ENABLE_TOUCH
+  // Initialize before the slower panel setup. FT3168 can enter monitor mode,
+  // where shared-bus traffic may temporarily make it stop acknowledging I2C.
+  touchState.available = initializeTouch();
+#if GLOBE_ENABLE_SERIAL_STATS
+  Serial.printf("FT3168 touch: %s\n",
+                touchState.available ? "ready" : "not detected");
+#endif
+#endif
 
   const uint8_t panelId = detectPanelController();
   if (panelId == kSh8601Id) {
@@ -1213,7 +1505,11 @@ void loop() {
   if (elapsedMs > 100) {
     elapsedMs = 100;
   }
-  rotationQ16 += elapsedMs * kRotationStepQ16PerMs;
+#if GLOBE_ENABLE_TOUCH
+  updateTouchInteraction(now, elapsedMs);
+#else
+  rotationQ16 += elapsedMs * kAutoRotationVelocityQ16PerMs;
+#endif
 
 #if GLOBE_ENABLE_SERIAL_STATS || GLOBE_ENABLE_SCREENSHOT
   const uint32_t renderStartUs = micros();

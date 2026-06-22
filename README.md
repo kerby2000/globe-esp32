@@ -7,6 +7,26 @@ The visual follows the supplied reference: black background, transparent dark
 sphere, cyan/white geographic outlines, a soft atmospheric rim, fixed clock/date
 placeholder text, and an optional debug FPS counter.
 
+## Touch interaction
+
+The FT3168 touch controller is enabled in all build profiles:
+
+- Touch and hold pauses automatic rotation.
+- Drag horizontally to rotate the globe manually. A full-width drag is one
+  complete revolution.
+- Release after a drag to continue with inertia; the speed then settles back
+  to automatic rotation.
+- Double-tap resets the globe to its startup longitude.
+- A stationary 700 ms long press is detected by `handleLongPress()` as the hook
+  for a future settings/speed-control screen.
+
+This first interaction pass intentionally leaves the sphere latitude fixed.
+Touch uses the board's shared 300 kHz I2C bus on GPIO47/48 and adds no
+floating-point work to the frame loop. Startup allows 250 ms for the FT3168 to
+finish powering up instead of relying on a single early probe. If detection
+still fails, rendering continues with automatic rotation while touch recovery
+is retried once per second.
+
 ## Build and upload
 
 Install PlatformIO, connect the board, then run:
@@ -53,12 +73,16 @@ QSPI-only timings.
   preserving fractional coastline coverage before the 4-bit quantization.
 - The detailed front surface remains at 1024×512 but now occupies 256 KB
   instead of 512 KB. A separate 512×256 texture packs two four-bit blurred
-  back-surface samples per byte, producing the transparent-globe underlay.
+  back-surface samples per byte. That layer is generated from blurred
+  coastlines, major lakes/rivers, and deterministic geographically localized
+  fog; it contains no filled land shadow.
 - At startup, `buildSphereLut()` projects globe pixels to longitude and stores
   longitude, four-bit shading, and two-bit subpixel rim coverage in a compact
   16-bit PSRAM LUT. Latitude is shared by each scanline.
-- A static exterior cyan halo is baked into both reusable framebuffers. A 4×4
-  setup-time coverage estimate smooths the sphere silhouette.
+- A 4×4 setup-time coverage estimate provides one-pixel silhouette
+  antialiasing. The experimental wide soft-rim treatment was removed.
+- The original subtle exterior cyan halo is baked into both reusable
+  framebuffers, adding no recurring render cost.
 - The expensive `sqrt`, `asin`, and `atan2` calls run only once during setup.
 - Each frame uses integer texture samples and directly indexes a 32 KB
   precomputed RGB565 color table. The hot scanline loop is unrolled by eight,
@@ -84,8 +108,9 @@ Each packed framebuffer and the sphere LUT use about 358 KB. The front and back
 textures use 256 KB and 64 KB of flash. The direct globe color table uses 32 KB
 of internal RAM and the exact overlay component tables use 36 KB. The release
 build uses 8192-pixel QSPI chunks and an 80 MHz requested bus clock. The
-measured rate on the connected target board is a stable 30.56 FPS with the
-antialiased overlay, compared with 5 FPS for the initial single-buffer renderer.
+measured rate on the connected target board is a stable 30.28 FPS with touch
+polling and the antialiased overlay, compared with 5 FPS for the initial
+single-buffer renderer.
 
 ## Performance profiling
 
@@ -107,7 +132,14 @@ QSPI-only time. Measurements on this board:
 | + dedicated packed 512×256 back layer | 41.05 ms | 38.60 ms | 2.45 ms | 21.71 ms | 24.35 |
 | + targeted `-O3` | 37.99 ms | 35.59 ms | 2.41 ms | 22.13 ms | 26.31 |
 | + hot loop in internal executable RAM (v0.4) | 36.91 ms | 34.50 ms | 2.41 ms | 22.14 ms | 27.08 |
-| Packed front, back-phase reuse, overlay on display core, 8× unroll | **32.71 ms** | **32.71 ms** | **2.32 ms** | **23.17 ms** | **30.56** |
+| Packed front, back-phase reuse, overlay on display core, 8× unroll | 32.71 ms | 32.71 ms | 2.32 ms | 23.17 ms | 30.56 |
+| Restored v0.5 rim + tighter physical-line/fog back layer | 32.77 ms | 32.77 ms | 2.32 ms | 23.16 ms | 30.50 |
+| + FT3168 polling and horizontal gestures | **32.75 ms** | **32.75 ms** | **2.29 ms** | **23.18 ms** | **30.28** |
+
+The current visual pass keeps the v0.5 rim and sharp 1024×512 front geography.
+Only the back texture and its pale green-cyan color treatment differ.
+Idle FT3168 polling adds about 0.24 ms to the complete frame period but does
+not change the measured globe render stage.
 
 The 60 MHz request measured identically to 40 MHz, consistent with the ESP32
 SPI divider selecting the same effective clock. A 512×256 front texture remains
@@ -117,9 +149,9 @@ reduces the intentionally blurred back layer, leaving the detailed front map
 unchanged.
 
 Rendering and display work run concurrently on separate cores. The reported
-23.17 ms display-task time includes the 2.32 ms overlay phase and the 20.85 ms
-QSPI phase. Final FPS is limited by the 32.71 ms globe render stage rather than
-the sum of render and display-task times.
+23.18 ms display-task time includes the 2.29 ms overlay phase and the 20.89 ms
+QSPI phase. Final FPS remains limited by the 32.75 ms globe render stage plus
+the small touch-polling cost rather than by display transfer.
 
 ## Capturing the framebuffer
 
@@ -147,13 +179,15 @@ python tools/generate_world_map.py --width 1024 --height 512 --supersample 4 `
   --output src/world_texture.h --front-output src/world_front_1024.h `
   --preview world-texture-preview.png
 python tools/generate_world_map.py --width 512 --height 256 --supersample 4 `
-  --output src/world_texture_512.h --back-output src/world_back_512.h `
+  --back-style fog --output src/world_texture_512.h `
+  --back-output src/world_back_512.h `
   --preview world-texture-512-preview.png
 ```
 
 The script downloads pinned Natural Earth physical vector layers, filters lakes
 and rivers to major features, and bakes detailed/blurred intensity channels at
-4× resolution before LANCZOS downsampling.
+4× resolution before LANCZOS downsampling. `--back-style legacy` remains
+available for direct visual and performance comparisons.
 Natural Earth data is public domain:
 <https://www.naturalearthdata.com/about/terms-of-use/>.
 

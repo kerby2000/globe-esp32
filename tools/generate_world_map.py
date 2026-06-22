@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import random
 import urllib.request
 from pathlib import Path
 
@@ -131,6 +132,39 @@ def scaled(image: Image.Image, numerator: int, denominator: int) -> Image.Image:
     return image.point(lambda value: value * numerator // denominator)
 
 
+def seamless_noise(
+    width: int, height: int, columns: int, rows: int, seed: int
+) -> Image.Image:
+    """Create deterministic low-frequency noise that wraps at longitude ±180°."""
+    rng = random.Random(seed)
+    values = [
+        [rng.randrange(256) for _ in range(columns)] for _ in range(rows)
+    ]
+    image = Image.new("L", (columns + 1, rows))
+    pixels = image.load()
+    for y in range(rows):
+        for x in range(columns):
+            pixels[x, y] = values[y][x]
+        pixels[columns, y] = values[y][0]
+    return image.resize((width, height), Image.Resampling.BICUBIC)
+
+
+def build_fog(width: int, height: int, physical: Image.Image) -> Image.Image:
+    """Build soft luminous patches concentrated around physical map features."""
+    coarse = seamless_noise(width, height, 22, 11, 0xC10BE)
+    medium = seamless_noise(width, height, 46, 23, 0xF09)
+    noise = ImageChops.blend(coarse, medium, 0.38)
+    noise = noise.filter(ImageFilter.GaussianBlur(1.8))
+    # Remove the low pedestal so the result is isolated translucent clouds,
+    # not a uniform gray veil over every ocean.
+    noise = noise.point(lambda value: max(0, min(255, (value - 96) * 2.15)))
+
+    envelope = physical.filter(ImageFilter.GaussianBlur(9.0))
+    envelope = envelope.point(lambda value: min(255, value * 4))
+    fog = ImageChops.multiply(noise, envelope)
+    return scaled(fog.filter(ImageFilter.GaussianBlur(2.5)), 120, 255)
+
+
 def build_texture(
     land_data: dict,
     coastline_data: dict,
@@ -139,6 +173,7 @@ def build_texture(
     width: int,
     height: int,
     supersample: int,
+    back_style: str,
 ) -> tuple[bytes, Image.Image, Image.Image]:
     work_width = width * supersample
     work_height = height * supersample
@@ -203,21 +238,37 @@ def build_texture(
     front = ImageChops.lighter(front, lakes)
     front = ImageChops.lighter(front, rivers)
 
-    # A broad, low-contrast version is sampled using the back-surface longitude.
-    # This creates the translucent blurred continents visible through the globe.
     physical = ImageChops.lighter(coastline, lakes)
-    physical = ImageChops.lighter(physical, scaled(rivers, 3, 5))
-    back = scaled(
-        land.filter(ImageFilter.GaussianBlur(2.5 * supersample)), 35, 255
-    )
-    back = ImageChops.lighter(
-        back,
-        scaled(
-            physical.filter(ImageFilter.GaussianBlur(5.0 * supersample)),
-            155,
+    physical = ImageChops.lighter(physical, scaled(rivers, 4, 5))
+    if back_style == "legacy":
+        back = scaled(
+            land.filter(ImageFilter.GaussianBlur(2.5 * supersample)), 35, 255
+        )
+        back = ImageChops.lighter(
+            back,
+            scaled(
+                physical.filter(ImageFilter.GaussianBlur(5.0 * supersample)),
+                155,
+                255,
+            ),
+        )
+    else:
+        # The far hemisphere is luminous physical geography rather than a dark
+        # land silhouette. Tight and broad line glows preserve recognizable
+        # structure; deterministic fog adds diffuse glassy patches.
+        back = scaled(
+            physical.filter(ImageFilter.GaussianBlur(1.6 * supersample)),
+            205,
             255,
-        ),
-    )
+        )
+        back = ImageChops.lighter(
+            back,
+            scaled(
+                physical.filter(ImageFilter.GaussianBlur(4.8 * supersample)),
+                105,
+                255,
+            ),
+        )
 
     # LANCZOS converts the high-resolution vector rasterization into fractional
     # edge coverage at the final texture size. The 4-bit quantizer preserves
@@ -225,6 +276,11 @@ def build_texture(
     target_size = (width, height)
     front = front.resize(target_size, Image.Resampling.LANCZOS)
     back = back.resize(target_size, Image.Resampling.LANCZOS)
+    if back_style == "fog":
+        physical_target = physical.resize(target_size, Image.Resampling.LANCZOS)
+        back = ImageChops.lighter(
+            back, build_fog(width, height, physical_target)
+        )
 
     front_values = front.load()
     back_values = back.load()
@@ -366,6 +422,9 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--supersample", type=int, default=4)
+    parser.add_argument(
+        "--back-style", choices=("fog", "legacy"), default="fog"
+    )
     parser.add_argument("--output", type=Path, default=Path("src/world_texture.h"))
     parser.add_argument("--preview", type=Path, default=Path("world-texture-preview.png"))
     parser.add_argument("--front-output", type=Path)
@@ -383,6 +442,7 @@ def main() -> None:
         args.width,
         args.height,
         args.supersample,
+        args.back_style,
     )
     write_header(args.output, packed, args.width, args.height)
     if args.front_output is not None:
