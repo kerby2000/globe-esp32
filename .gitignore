@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 *.code-workspace
 globe-esp32*.zip
+src/wifi_secrets.h

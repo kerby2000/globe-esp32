@@ -12,8 +12,8 @@ placeholder text, and an optional debug FPS counter.
 The FT3168 touch controller is enabled in all build profiles:
 
 - Touch and hold pauses automatic rotation.
-- Drag horizontally to rotate the globe manually. A full-width drag is one
-  complete revolution.
+- Drag horizontally to rotate the globe in the same direction as the finger.
+  A full-width drag is one complete revolution.
 - Release after a drag to continue with inertia; the speed then settles back
   to automatic rotation.
 - Double-tap resets the globe to its startup longitude.
@@ -26,6 +26,29 @@ floating-point work to the frame loop. Startup allows 250 ms for the FT3168 to
 finish powering up instead of relying on a single early probe. If detection
 still fails, rendering continues with automatic rotation while touch recovery
 is retried once per second.
+
+## Real time and RTC
+
+The clock uses the onboard PCF85063 RTC at I2C address `0x51`:
+
+- At boot, valid RTC time is loaded immediately and used before networking is
+  available.
+- A low-priority background task connects to Wi-Fi, synchronizes from NTP, and
+  writes the corrected UTC time back to the PCF85063.
+- The RTC stores UTC. Display formatting uses the Brussels CET/CEST rules, so
+  daylight-saving transitions do not require rewriting the RTC.
+- Clock state is checked once per second. The compact alpha-glyph overlay is
+  rebuilt only when its visible minute, weekday, or date changes.
+- Wi-Fi is disabled again after synchronization.
+
+Local credentials are kept in the ignored `src/wifi_secrets.h` file. To
+configure another checkout:
+
+```powershell
+Copy-Item src/wifi_secrets.example.h src/wifi_secrets.h
+```
+
+Then edit only `src/wifi_secrets.h`. Never add that file to Git.
 
 ## Build and upload
 
@@ -108,9 +131,9 @@ Each packed framebuffer and the sphere LUT use about 358 KB. The front and back
 textures use 256 KB and 64 KB of flash. The direct globe color table uses 32 KB
 of internal RAM and the exact overlay component tables use 36 KB. The release
 build uses 8192-pixel QSPI chunks and an 80 MHz requested bus clock. The
-measured rate on the connected target board is a stable 30.28 FPS with touch
-polling and the antialiased overlay, compared with 5 FPS for the initial
-single-buffer renderer.
+measured rate on the connected target board is a stable 30.23 FPS with touch,
+real-time clock updates, and the antialiased overlay, compared with 5 FPS for
+the initial single-buffer renderer.
 
 ## Performance profiling
 
@@ -134,7 +157,8 @@ QSPI-only time. Measurements on this board:
 | + hot loop in internal executable RAM (v0.4) | 36.91 ms | 34.50 ms | 2.41 ms | 22.14 ms | 27.08 |
 | Packed front, back-phase reuse, overlay on display core, 8× unroll | 32.71 ms | 32.71 ms | 2.32 ms | 23.17 ms | 30.56 |
 | Restored v0.5 rim + tighter physical-line/fog back layer | 32.77 ms | 32.77 ms | 2.32 ms | 23.16 ms | 30.50 |
-| + FT3168 polling and horizontal gestures | **32.75 ms** | **32.75 ms** | **2.29 ms** | **23.18 ms** | **30.28** |
+| + FT3168 polling and horizontal gestures | 32.75 ms | 32.75 ms | 2.29 ms | 23.18 ms | 30.28 |
+| + RTC/NTP and dynamic real-time overlay | **32.74 ms** | **32.74 ms** | **2.18 ms** | **23.12 ms** | **30.23** |
 
 The current visual pass keeps the v0.5 rim and sharp 1024×512 front geography.
 Only the back texture and its pale green-cyan color treatment differ.

@@ -1,12 +1,23 @@
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
+#include <WiFi.h>
 #include <esp_heap_caps.h>
+#include <esp_sntp.h>
 #include <freertos/queue.h>
 #include <math.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "font5x7.h"
 #include "ui_fonts.h"
+
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#else
+#define GLOBE_WIFI_SSID ""
+#define GLOBE_WIFI_PASSWORD ""
+#endif
 
 #ifndef GLOBE_USE_HALF_TEXTURE
 #define GLOBE_USE_HALF_TEXTURE 0
@@ -114,16 +125,16 @@ constexpr int8_t kLcdData3 = 14;
 constexpr int8_t kLcdReset = 21;
 constexpr int8_t kAmoledEnable = 42;
 constexpr uint8_t kSh8601Id = 0x86;
+constexpr int8_t kSharedI2cSda = 47;
+constexpr int8_t kSharedI2cScl = 48;
+constexpr uint32_t kSharedI2cHz = 300000;
 
 #if GLOBE_ENABLE_TOUCH
 // FT3168 shares this I2C bus with the optional IMU and RTC.
-constexpr int8_t kTouchSda = 47;
-constexpr int8_t kTouchScl = 48;
 constexpr uint8_t kTouchAddress = 0x38;
 constexpr uint8_t kTouchModeRegister = 0x00;
 constexpr uint8_t kTouchPointCountRegister = 0x02;
 constexpr uint8_t kTouchFirstPointRegister = 0x03;
-constexpr uint32_t kTouchI2cHz = 300000;
 constexpr uint16_t kTouchStartupTimeoutMs = 250;
 constexpr uint16_t kTouchStartupRetryMs = 10;
 constexpr uint16_t kTouchRecoveryIntervalMs = 1000;
@@ -172,6 +183,16 @@ constexpr uint16_t kWeekdayStyleBase = 256;
 constexpr uint16_t kDateStyleBase = 272;
 constexpr uint16_t kOverlayStyleCount = 288;
 constexpr uint16_t kOverlayPixelCapacity = 16000;
+constexpr uint8_t kRtcAddress = 0x51;
+constexpr uint8_t kRtcTimeRegister = 0x04;
+constexpr time_t kMinimumValidEpoch = 1704067200;  // 2024-01-01 UTC.
+constexpr char kBrusselsTimezone[] =
+    "CET-1CEST,M3.5.0/2,M10.5.0/3";
+constexpr char kNtpServer1[] = "pool.ntp.org";
+constexpr char kNtpServer2[] = "time.cloudflare.com";
+constexpr char kNtpServer3[] = "time.google.com";
+constexpr uint32_t kWifiConnectTimeoutMs = 20000;
+constexpr uint32_t kNtpSyncTimeoutMs = 20000;
 
 // One full rotation per 18 seconds, represented as Q16.16 texels/ms.
 constexpr int32_t kAutoRotationVelocityQ16PerMs =
@@ -220,6 +241,12 @@ uint8_t overlayBlueBlend[kOverlayStyleCount * 32];
 uint32_t *overlayPixels = nullptr;
 uint16_t overlayPixelCount = 0;
 bool overlayOverflow = false;
+SemaphoreHandle_t overlayMutex = nullptr;
+volatile bool systemTimeValid = false;
+uint32_t lastClockUpdateMs = 0;
+char displayedWeekday[10] = "SATURDAY";
+char displayedTime[6] = "10:43";
+char displayedDate[12] = "20 JUN 2026";
 
 uint32_t rotationQ16 = 0;
 uint32_t previousFrameMs = 0;
@@ -270,15 +297,27 @@ volatile uint32_t profileQspiMicros = 0;
 QueueHandle_t freeFrameQueue = nullptr;
 QueueHandle_t readyFrameQueue = nullptr;
 
-#if GLOBE_ENABLE_TOUCH
-bool readTouchRegisters(uint8_t reg, uint8_t *data, uint8_t length) {
-  Wire.beginTransmission(kTouchAddress);
+bool initializeSharedI2c() {
+  static bool initialized = false;
+  if (initialized) {
+    return true;
+  }
+  initialized = Wire.begin(kSharedI2cSda, kSharedI2cScl, kSharedI2cHz);
+  if (initialized) {
+    Wire.setTimeOut(20);
+  }
+  return initialized;
+}
+
+bool readI2cRegisters(uint8_t address, uint8_t reg, uint8_t *data,
+                      uint8_t length) {
+  Wire.beginTransmission(address);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) {
     return false;
   }
 
-  if (Wire.requestFrom(kTouchAddress, length) != length) {
+  if (Wire.requestFrom(address, length) != length) {
     while (Wire.available()) {
       Wire.read();
     }
@@ -288,6 +327,160 @@ bool readTouchRegisters(uint8_t reg, uint8_t *data, uint8_t length) {
     data[index] = static_cast<uint8_t>(Wire.read());
   }
   return true;
+}
+
+bool writeI2cRegisters(uint8_t address, uint8_t reg, const uint8_t *data,
+                       uint8_t length) {
+  Wire.beginTransmission(address);
+  Wire.write(reg);
+  Wire.write(data, length);
+  return Wire.endTransmission() == 0;
+}
+
+uint8_t bcdToDecimal(uint8_t value) {
+  return static_cast<uint8_t>((value >> 4) * 10 + (value & 0x0F));
+}
+
+uint8_t decimalToBcd(uint8_t value) {
+  return static_cast<uint8_t>((value / 10) << 4 | (value % 10));
+}
+
+int64_t daysFromCivil(int year, unsigned month, unsigned day) {
+  // Gregorian calendar to Unix-day conversion. This keeps RTC decoding in UTC
+  // without temporarily changing the process-wide Brussels timezone.
+  year -= month <= 2;
+  const int era = year / 400;
+  const unsigned yearOfEra = static_cast<unsigned>(year - era * 400);
+  const unsigned adjustedMonth = month > 2 ? month - 3 : month + 9;
+  const unsigned dayOfYear =
+      (153 * adjustedMonth + 2) / 5 + day - 1;
+  const unsigned dayOfEra =
+      yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+  return static_cast<int64_t>(era) * 146097 + dayOfEra - 719468;
+}
+
+bool readRtcUtc(time_t &epoch) {
+  uint8_t registers[7];
+  if (!readI2cRegisters(kRtcAddress, kRtcTimeRegister, registers,
+                        sizeof(registers))) {
+    return false;
+  }
+
+  // Bit 7 of the seconds register is VL. When set, oscillator history or
+  // backup voltage was unreliable and the calendar must not be trusted.
+  if ((registers[0] & 0x80U) != 0) {
+    return false;
+  }
+
+  const int second = bcdToDecimal(registers[0] & 0x7F);
+  const int minute = bcdToDecimal(registers[1] & 0x7F);
+  const int hour = bcdToDecimal(registers[2] & 0x3F);
+  const int day = bcdToDecimal(registers[3] & 0x3F);
+  const int month = bcdToDecimal(registers[5] & 0x1F);
+  const int year = 2000 + bcdToDecimal(registers[6]);
+  if (second > 59 || minute > 59 || hour > 23 || day < 1 || day > 31 ||
+      month < 1 || month > 12 || year < 2024 || year > 2099) {
+    return false;
+  }
+
+  epoch = static_cast<time_t>(
+      daysFromCivil(year, static_cast<unsigned>(month),
+                    static_cast<unsigned>(day)) *
+          86400 +
+      hour * 3600 + minute * 60 + second);
+  return epoch >= kMinimumValidEpoch;
+}
+
+bool writeRtcUtc(time_t epoch) {
+  struct tm utc;
+  if (gmtime_r(&epoch, &utc) == nullptr) {
+    return false;
+  }
+  const uint8_t registers[7] = {
+      decimalToBcd(utc.tm_sec),
+      decimalToBcd(utc.tm_min),
+      decimalToBcd(utc.tm_hour),
+      decimalToBcd(utc.tm_mday),
+      decimalToBcd(utc.tm_wday),
+      decimalToBcd(utc.tm_mon + 1),
+      decimalToBcd((utc.tm_year + 1900) % 100),
+  };
+  return writeI2cRegisters(kRtcAddress, kRtcTimeRegister, registers,
+                           sizeof(registers));
+}
+
+bool setSystemTimeFromRtc() {
+  time_t rtcEpoch = 0;
+  if (!readRtcUtc(rtcEpoch)) {
+    return false;
+  }
+  const struct timeval value = {rtcEpoch, 0};
+  if (settimeofday(&value, nullptr) != 0) {
+    return false;
+  }
+  systemTimeValid = true;
+  return true;
+}
+
+void networkTimeTask(void *parameter) {
+  if (GLOBE_WIFI_SSID[0] == '\0') {
+#if GLOBE_ENABLE_SERIAL_STATS
+    Serial.println("NTP: Wi-Fi credentials not configured");
+#endif
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(GLOBE_WIFI_SSID, GLOBE_WIFI_PASSWORD);
+#if GLOBE_ENABLE_SERIAL_STATS
+  Serial.println("NTP: connecting Wi-Fi");
+#endif
+
+  const uint32_t connectStartMs = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - connectStartMs < kWifiConnectTimeoutMs) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    configTzTime(kBrusselsTimezone, kNtpServer1, kNtpServer2, kNtpServer3);
+    const uint32_t syncStartMs = millis();
+    time_t now = 0;
+    while (millis() - syncStartMs < kNtpSyncTimeoutMs) {
+      if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+        time(&now);
+      }
+      if (now >= kMinimumValidEpoch) {
+        systemTimeValid = true;
+        const bool rtcWritten = writeRtcUtc(now);
+#if GLOBE_ENABLE_SERIAL_STATS
+        Serial.printf("NTP: synchronized, RTC %s\n",
+                      rtcWritten ? "updated" : "write failed");
+#endif
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+#if GLOBE_ENABLE_SERIAL_STATS
+    if (now < kMinimumValidEpoch) {
+      Serial.println("NTP: synchronization timed out");
+    }
+#endif
+  } else {
+#if GLOBE_ENABLE_SERIAL_STATS
+    Serial.println("NTP: Wi-Fi connection timed out");
+#endif
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  vTaskDelete(nullptr);
+}
+
+#if GLOBE_ENABLE_TOUCH
+bool readTouchRegisters(uint8_t reg, uint8_t *data, uint8_t length) {
+  return readI2cRegisters(kTouchAddress, reg, data, length);
 }
 
 bool configureTouchController() {
@@ -304,10 +497,9 @@ bool configureTouchController() {
 }
 
 bool initializeTouch() {
-  if (!Wire.begin(kTouchSda, kTouchScl, kTouchI2cHz)) {
+  if (!initializeSharedI2c()) {
     return false;
   }
-  Wire.setTimeOut(20);
 
   // FT3168 needs time after power-up before it starts acknowledging I2C.
   // The old one-shot probe happened to work in debug builds because their
@@ -407,7 +599,7 @@ void updateTouchInteraction(uint32_t now, uint32_t elapsedMs) {
     const int16_t deltaX = x - touchState.lastX;
     if (touchState.dragging && deltaX != 0) {
       const int32_t rotationDeltaQ16 =
-          static_cast<int32_t>(deltaX) * kDragSensitivityQ16PerPixel;
+          -static_cast<int32_t>(deltaX) * kDragSensitivityQ16PerPixel;
       rotationQ16 += static_cast<uint32_t>(rotationDeltaQ16);
 
       int32_t sampleVelocity = rotationDeltaQ16 /
@@ -989,22 +1181,69 @@ void appendCenteredAlphaText(const ui_fonts::Font &font, const char *text,
                   styleBase);
 }
 
-void buildOverlayPixels() {
+void buildOverlayPixels(const char *weekday, const char *timeText,
+                        const char *date) {
   // Font decoding and transparent-pixel rejection happen only when overlay
-  // text changes. A real clock can call this once per minute instead of
-  // walking packed glyph bitmaps during every globe frame.
+  // text changes instead of walking packed glyph bitmaps every globe frame.
   overlayPixelCount = 0;
   overlayOverflow = false;
-  appendCenteredAlphaText(ui_fonts::kWeekday, "SATURDAY", 159,
+  appendCenteredAlphaText(ui_fonts::kWeekday, weekday, 159,
                           kWeekdayStyleBase);
-  const char *time = "10:43";
   appendGlowingTime(
-      time, (kDisplayWidth - alphaTextWidth(ui_fonts::kTime, time)) / 2, 177);
-  appendCenteredAlphaText(ui_fonts::kDate, "20 JUN 2026", 296,
-                          kDateStyleBase);
+      timeText,
+      (kDisplayWidth - alphaTextWidth(ui_fonts::kTime, timeText)) / 2, 177);
+  appendCenteredAlphaText(ui_fonts::kDate, date, 296, kDateStyleBase);
+}
+
+bool refreshClockOverlay(bool force) {
+  if (!systemTimeValid || overlayPixels == nullptr) {
+    return false;
+  }
+
+  time_t now;
+  time(&now);
+  if (now < kMinimumValidEpoch) {
+    return false;
+  }
+  struct tm local;
+  if (localtime_r(&now, &local) == nullptr) {
+    return false;
+  }
+
+  static const char *const weekdays[] = {
+      "SUNDAY",   "MONDAY", "TUESDAY", "WEDNESDAY",
+      "THURSDAY", "FRIDAY", "SATURDAY",
+  };
+  static const char *const months[] = {
+      "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+      "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+  };
+  char weekday[10];
+  char timeText[6];
+  char date[12];
+  snprintf(weekday, sizeof(weekday), "%s", weekdays[local.tm_wday]);
+  snprintf(timeText, sizeof(timeText), "%02d:%02d", local.tm_hour,
+           local.tm_min);
+  snprintf(date, sizeof(date), "%02d %s %04d", local.tm_mday,
+           months[local.tm_mon], local.tm_year + 1900);
+
+  if (!force && strcmp(weekday, displayedWeekday) == 0 &&
+      strcmp(timeText, displayedTime) == 0 &&
+      strcmp(date, displayedDate) == 0) {
+    return true;
+  }
+
+  xSemaphoreTake(overlayMutex, portMAX_DELAY);
+  buildOverlayPixels(weekday, timeText, date);
+  snprintf(displayedWeekday, sizeof(displayedWeekday), "%s", weekday);
+  snprintf(displayedTime, sizeof(displayedTime), "%s", timeText);
+  snprintf(displayedDate, sizeof(displayedDate), "%s", date);
+  xSemaphoreGive(overlayMutex);
+  return !overlayOverflow;
 }
 
 GLOBE_RENDER_OPT void drawOverlay(uint16_t *target) {
+  xSemaphoreTake(overlayMutex, portMAX_DELAY);
   for (uint16_t index = 0; index < overlayPixelCount; ++index) {
     const uint32_t packed = overlayPixels[index];
     const uint16_t styleIndex = packed >> 18;
@@ -1015,6 +1254,7 @@ GLOBE_RENDER_OPT void drawOverlay(uint16_t *target) {
                     overlayColors[styleIndex], overlayAlphas[styleIndex]);
 #endif
   }
+  xSemaphoreGive(overlayMutex);
 
 #if GLOBE_ENABLE_SERIAL_STATS
   // Keep FPS visible only in the profiling build.
@@ -1378,9 +1618,14 @@ void setup() {
   Serial.println("\nESP32-S3 AMOLED rotating globe");
 #endif
 
+  setenv("TZ", kBrusselsTimezone, 1);
+  tzset();
+
   pinMode(kAmoledEnable, OUTPUT);
   digitalWrite(kAmoledEnable, HIGH);
   delay(20);
+
+  initializeSharedI2c();
 
 #if GLOBE_ENABLE_TOUCH
   // Initialize before the slower panel setup. FT3168 can enter monitor mode,
@@ -1390,6 +1635,12 @@ void setup() {
   Serial.printf("FT3168 touch: %s\n",
                 touchState.available ? "ready" : "not detected");
 #endif
+#endif
+
+  const bool rtcLoaded = setSystemTimeFromRtc();
+#if GLOBE_ENABLE_SERIAL_STATS
+  Serial.printf("PCF85063 RTC: %s\n",
+                rtcLoaded ? "time loaded" : "invalid or unavailable");
 #endif
 
   const uint8_t panelId = detectPanelController();
@@ -1450,9 +1701,11 @@ void setup() {
   overlayPixels = static_cast<uint32_t *>(heap_caps_malloc(
       static_cast<size_t>(kOverlayPixelCapacity) * sizeof(uint32_t),
       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  overlayMutex = xSemaphoreCreateMutex();
 
   if (frameBuffers[0] == nullptr || frameBuffers[1] == nullptr ||
-      sphereLut == nullptr || overlayPixels == nullptr) {
+      sphereLut == nullptr || overlayPixels == nullptr ||
+      overlayMutex == nullptr) {
     haltWithMessage("PSRAM ALLOCATION FAILED");
   }
   initializeBackground(frameBuffers[0], kFrameWidth, kFrameHeight,
@@ -1462,7 +1715,8 @@ void setup() {
 
   buildColorPalettes();
   buildSphereLut();
-  buildOverlayPixels();
+  buildOverlayPixels(displayedWeekday, displayedTime, displayedDate);
+  refreshClockOverlay(true);
   if (overlayOverflow) {
     haltWithMessage("OVERLAY PIXEL CAPACITY");
   }
@@ -1478,8 +1732,15 @@ void setup() {
                               nullptr, 0) != pdPASS) {
     haltWithMessage("DISPLAY TASK FAILED");
   }
+  if (xTaskCreatePinnedToCore(networkTimeTask, "globe-ntp", 6144, nullptr, 1,
+                              nullptr, 0) != pdPASS) {
+#if GLOBE_ENABLE_SERIAL_STATS
+    Serial.println("NTP: task creation failed");
+#endif
+  }
 
   previousFrameMs = millis();
+  lastClockUpdateMs = previousFrameMs;
 
 #if GLOBE_ENABLE_SERIAL_STATS
   Serial.printf("Frame buffer: %u bytes\n",
@@ -1504,6 +1765,10 @@ void loop() {
   previousFrameMs = now;
   if (elapsedMs > 100) {
     elapsedMs = 100;
+  }
+  if (now - lastClockUpdateMs >= 1000) {
+    lastClockUpdateMs = now;
+    refreshClockOverlay(false);
   }
 #if GLOBE_ENABLE_TOUCH
   updateTouchInteraction(now, elapsedMs);
