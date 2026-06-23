@@ -4,8 +4,8 @@ Minimal full-screen globe demo for the original Waveshare
 ESP32-S3-Touch-AMOLED-1.43 (466×466 QSPI AMOLED).
 
 The visual follows the supplied reference: black background, transparent dark
-sphere, cyan/white geographic outlines, a soft atmospheric rim, fixed clock/date
-placeholder text, and an optional debug FPS counter.
+sphere, cyan/white geographic outlines, a soft atmospheric rim, real clock/date
+overlays, and an optional debug FPS counter.
 
 ## Touch interaction
 
@@ -17,8 +17,8 @@ The FT3168 touch controller is enabled in all build profiles:
 - Release after a drag to continue with inertia; the speed then settles back
   to automatic rotation.
 - Double-tap resets the globe to its startup longitude.
-- A stationary 700 ms long press is detected by `handleLongPress()` as the hook
-  for a future settings/speed-control screen.
+- A stationary 700 ms long press cycles through digital, analog, hybrid, and
+  globe-only display modes.
 
 This first interaction pass intentionally leaves the sphere latitude fixed.
 Touch uses the board's shared 300 kHz I2C bus on GPIO47/48 and adds no
@@ -37,8 +37,8 @@ The clock uses the onboard PCF85063 RTC at I2C address `0x51`:
   writes the corrected UTC time back to the PCF85063.
 - The RTC stores UTC. Display formatting uses the Brussels CET/CEST rules, so
   daylight-saving transitions do not require rewriting the RTC.
-- Clock state is checked once per second. The compact alpha-glyph overlay is
-  rebuilt only when its visible minute, weekday, or date changes.
+- Clock state is checked once per second. Digital text is rebuilt only when its
+  visible minute, weekday, or date changes; analog hands update once per second.
 - Wi-Fi is disabled again after synchronization.
 
 Local credentials are kept in the ignored `src/wifi_secrets.h` file. To
@@ -84,7 +84,8 @@ rendering after several seconds.
 screenshots enabled but periodic serial stats disabled. Sending `P` returns a
 compact uptime/frame-count record for stability testing without autonomous USB
 output. Sending `Q` additionally returns cumulative render, transfer-task, and
-QSPI-only timings.
+QSPI-only timings. For visual testing, `M` cycles the clock mode and `1` through
+`4` select digital, analog, hybrid, and globe-only modes directly.
 
 ## Rendering design
 
@@ -114,6 +115,11 @@ QSPI-only timings.
   The large time includes a baked soft cyan glow. Transparent glyph pixels are
   rejected at setup and the remaining pixels are stored as a compact command
   list, ready to rebuild when a real clock value changes.
+- Four clock presentations are available: the original digital overlay, a
+  full-size analog face, a compact analog/digital hybrid, and globe-only mode.
+  The analog face uses translucent pale-cyan ticks and softly glowing hands.
+  Its trigonometric table is generated during setup; hand rasterization is
+  integer-only and runs once per second rather than once per globe frame.
 - Exact RGB565 overlay blend tables are generated during setup. Fixed-overlay
   composition runs on the display core immediately before QSPI transfer,
   overlapping it with the next globe render instead of extending the critical
@@ -158,7 +164,11 @@ QSPI-only time. Measurements on this board:
 | Packed front, back-phase reuse, overlay on display core, 8× unroll | 32.71 ms | 32.71 ms | 2.32 ms | 23.17 ms | 30.56 |
 | Restored v0.5 rim + tighter physical-line/fog back layer | 32.77 ms | 32.77 ms | 2.32 ms | 23.16 ms | 30.50 |
 | + FT3168 polling and horizontal gestures | 32.75 ms | 32.75 ms | 2.29 ms | 23.18 ms | 30.28 |
-| + RTC/NTP and dynamic real-time overlay | **32.74 ms** | **32.74 ms** | **2.18 ms** | **23.12 ms** | **30.23** |
+| + RTC/NTP and dynamic real-time overlay | 32.74 ms | 32.74 ms | 2.18 ms | 23.12 ms | 30.23 |
+| Digital clock mode | 32.87 ms | 32.87 ms | 2.67 ms | 23.61 ms | 30.13 |
+| Full analog clock mode | 32.64 ms | 32.64 ms | 2.37 ms | 23.13 ms | 29.76 |
+| Hybrid clock mode | 32.82 ms | 32.82 ms | 2.89 ms | 23.67 ms | 29.64 |
+| Globe-only mode | **32.12 ms** | **32.12 ms** | **0.01 ms** | **20.84 ms** | **30.82** |
 
 The current visual pass keeps the v0.5 rim and sharp 1024×512 front geography.
 Only the back texture and its pale green-cyan color treatment differ.
