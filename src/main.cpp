@@ -33,6 +33,7 @@
 
 #if GLOBE_USE_PACKED_FRONT_TEXTURE
 #include "world_front_1024.h"
+#include "world_texture.h"
 namespace globe_texture = world_front_texture;
 #elif GLOBE_USE_HALF_TEXTURE
 #include "world_texture_512.h"
@@ -56,6 +57,14 @@ namespace globe_texture = world_texture;
 
 #ifndef GLOBE_ENABLE_TOUCH
 #define GLOBE_ENABLE_TOUCH 1
+#endif
+
+#ifndef GLOBE_ENABLE_XY_ROTATION
+#define GLOBE_ENABLE_XY_ROTATION 1
+#endif
+
+#ifndef GLOBE_ENABLE_SPAN_REFERENCE
+#define GLOBE_ENABLE_SPAN_REFERENCE 0
 #endif
 
 #ifndef GLOBE_DISPLAY_BUS_HZ
@@ -196,6 +205,78 @@ constexpr char kNtpServer3[] = "time.google.com";
 constexpr uint32_t kWifiConnectTimeoutMs = 20000;
 constexpr uint32_t kNtpSyncTimeoutMs = 20000;
 
+#if GLOBE_ENABLE_XY_ROTATION
+constexpr int16_t kMinimumPitchDegrees = -80;
+constexpr int16_t kMaximumPitchDegrees = 80;
+constexpr int16_t kMaximumPitchQ8 = kMaximumPitchDegrees * 256;
+constexpr int16_t kMinimumPitchQ8 = kMinimumPitchDegrees * 256;
+constexpr int16_t kPitchSensitivityQ8PerPixel =
+    ((kMaximumPitchDegrees - kMinimumPitchDegrees) << 8) / kDisplayHeight;
+constexpr uint16_t kPitchFrontUMask = 0x03FFU;
+constexpr uint16_t kPitchFrontVMask = 0x01FFU;
+constexpr uint16_t kPitchBackUMask = 0x03FFU;
+constexpr uint16_t kPitchBackVMask = 0x01FFU;
+constexpr int16_t kPitchAnchorDegrees[] = {
+    -80, -55, -25, 0, 25, 55, 80,
+};
+constexpr uint8_t kPitchAnchorCount =
+    sizeof(kPitchAnchorDegrees) / sizeof(kPitchAnchorDegrees[0]);
+constexpr uint8_t kZeroPitchAnchorIndex = 3;
+constexpr uint8_t kPitchPreviewBytesPerPixel = 3;
+constexpr uint8_t kPitchExactBytesPerPixel = 5;
+constexpr uint16_t kPitchExactStabilityMs = 150;
+constexpr uint16_t kPitchBackFadeMs = 300;
+constexpr uint16_t kProjectionTrigLutSize = 4097;
+
+enum class PitchDenseMode : uint8_t {
+  Zero = 0,
+  Preview,
+  Exact,
+  AnchorBlend,
+};
+
+#if GLOBE_ENABLE_SPAN_REFERENCE
+constexpr uint8_t kPitchCoordinateFractionBits = 6;
+constexpr uint16_t kPitchCoordinateOne =
+    1U << kPitchCoordinateFractionBits;
+constexpr uint16_t kPitchSpanErrorQ6 = kPitchCoordinateOne;
+constexpr uint16_t kPitchSpanCapacity = 16000;
+constexpr uint8_t kMaximumPitchSpansPerRow = 64;
+constexpr uint8_t kMaximumPitchSpanPixels = 64;
+
+struct PitchSpan {
+  uint16_t frontUQ6;
+  uint16_t frontVQ6;
+  uint16_t backUQ6;
+  uint16_t backVQ6;
+  int16_t frontUStepQ6;
+  int16_t frontVStepQ6;
+  int16_t backUStepQ6;
+  int16_t backVStepQ6;
+  uint16_t pixelCount;
+};
+
+struct PitchSpanRow {
+  uint16_t firstSpan;
+  uint8_t spanCount;
+  uint8_t reserved;
+};
+
+struct PitchSpanLut {
+  PitchSpan *spans;
+  PitchSpanRow rows[kLutDiameter];
+  uint16_t spanCount;
+  int16_t pitchQ8;
+  uint32_t buildMicros;
+};
+
+static_assert(sizeof(PitchSpan) == 18);
+static_assert(sizeof(PitchSpanRow) == 4);
+#endif
+static_assert(kPitchAnchorCount == 7);
+static_assert(kPitchAnchorDegrees[kZeroPitchAnchorIndex] == 0);
+#endif
+
 // One full rotation per 18 seconds, represented as Q16.16 texels/ms.
 constexpr int32_t kAutoRotationVelocityQ16PerMs =
     (static_cast<uint32_t>(globe_texture::kWidth) << 16) / 18000U;
@@ -223,6 +304,44 @@ uint16_t *frameBuffer = nullptr;
 uint16_t *frameBuffers[2] = {nullptr, nullptr};
 volatile uint16_t *lastComposedFrame = nullptr;
 uint16_t *sphereLut = nullptr;
+#if GLOBE_ENABLE_XY_ROTATION
+uint16_t *sphereNzQ15 = nullptr;
+#if GLOBE_ENABLE_SPAN_REFERENCE
+PitchSpanLut pitchSpanLuts[2] = {};
+PitchSpan pitchRowScratch[kMaximumPitchSpansPerRow];
+volatile int8_t activePitchLutIndex = -1;
+volatile int8_t readyPitchLutIndex = -1;
+#endif
+uint8_t *pitchAnchorMaps[kPitchAnchorCount] = {};
+uint8_t *pitchPreviewMaps[2] = {};
+uint8_t *pitchExactMap = nullptr;
+uint8_t *pitchFrontTexture = nullptr;
+uint8_t *pitchBackTextureHigh = nullptr;
+uint16_t projectionAsinVLut[kProjectionTrigLutSize];
+uint16_t projectionAtanULut[kProjectionTrigLutSize];
+portMUX_TYPE pitchLutMux = portMUX_INITIALIZER_UNLOCKED;
+TaskHandle_t pitchBuilderTaskHandle = nullptr;
+volatile PitchDenseMode activePitchMode = PitchDenseMode::Zero;
+volatile PitchDenseMode readyPitchMode = PitchDenseMode::Zero;
+volatile PitchDenseMode lastRenderedPitchMode = PitchDenseMode::Zero;
+volatile bool pitchSwapPending = false;
+volatile int8_t activePreviewMapIndex = -1;
+volatile int8_t readyPreviewMapIndex = -1;
+volatile int16_t readyPitchQ8 = 0;
+volatile uint32_t readyPitchGeneration = 0;
+volatile int16_t requestedPitchQ8 = 0;
+volatile uint32_t pitchRequestGeneration = 0;
+volatile uint32_t pitchLastChangeMs = 0;
+volatile bool pitchTouchActive = false;
+volatile bool pitchExactReady = false;
+volatile uint32_t pitchExactActivatedMs = 0;
+uint32_t pitchPreviewBuildMicros = 0;
+uint32_t pitchExactBuildMicros = 0;
+#if GLOBE_ENABLE_SCREENSHOT
+volatile bool screenshotForcePitchPreview = false;
+volatile bool screenshotForcePitchAnchorBlend = false;
+#endif
+#endif
 const uint8_t *worldTexture = globe_texture::kIntensity;
 uint16_t sphereLeft[kLutDiameter];
 uint16_t sphereRight[kLutDiameter];
@@ -266,6 +385,10 @@ ClockMode displayedClockMode = ClockMode::Count;
 bool clockOverlayDirty = true;
 
 uint32_t rotationQ16 = 0;
+#if GLOBE_ENABLE_XY_ROTATION
+int16_t pitchQ8 = 0;
+int16_t renderedPitchQ8 = 0;
+#endif
 uint32_t previousFrameMs = 0;
 
 #if GLOBE_ENABLE_TOUCH
@@ -274,6 +397,7 @@ struct TouchInteractionState {
   bool down = false;
   bool moved = false;
   bool dragging = false;
+  bool horizontalDragged = false;
   bool longPressHandled = false;
   bool previousTapValid = false;
   int16_t startX = 0;
@@ -309,15 +433,25 @@ uint32_t profileGlobeMicros = 0;
 uint32_t profileOverlayMicros = 0;
 volatile uint32_t profileTransferMicros = 0;
 volatile uint32_t profileQspiMicros = 0;
+bool screenshotFreezeRotation = false;
+bool screenshotBackHemisphereEnabled = true;
+constexpr uint16_t kScreenshotLongitudeStepTexels = 16;
 #endif
 
 QueueHandle_t freeFrameQueue = nullptr;
 QueueHandle_t readyFrameQueue = nullptr;
+SemaphoreHandle_t sharedI2cMutex = nullptr;
 
 bool initializeSharedI2c() {
   static bool initialized = false;
   if (initialized) {
     return true;
+  }
+  if (sharedI2cMutex == nullptr) {
+    sharedI2cMutex = xSemaphoreCreateMutex();
+    if (sharedI2cMutex == nullptr) {
+      return false;
+    }
   }
   initialized = Wire.begin(kSharedI2cSda, kSharedI2cScl, kSharedI2cHz);
   if (initialized) {
@@ -328,9 +462,14 @@ bool initializeSharedI2c() {
 
 bool readI2cRegisters(uint8_t address, uint8_t reg, uint8_t *data,
                       uint8_t length) {
+  if (sharedI2cMutex == nullptr) {
+    return false;
+  }
+  xSemaphoreTake(sharedI2cMutex, portMAX_DELAY);
   Wire.beginTransmission(address);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) {
+    xSemaphoreGive(sharedI2cMutex);
     return false;
   }
 
@@ -338,20 +477,28 @@ bool readI2cRegisters(uint8_t address, uint8_t reg, uint8_t *data,
     while (Wire.available()) {
       Wire.read();
     }
+    xSemaphoreGive(sharedI2cMutex);
     return false;
   }
   for (uint8_t index = 0; index < length; ++index) {
     data[index] = static_cast<uint8_t>(Wire.read());
   }
+  xSemaphoreGive(sharedI2cMutex);
   return true;
 }
 
 bool writeI2cRegisters(uint8_t address, uint8_t reg, const uint8_t *data,
                        uint8_t length) {
+  if (sharedI2cMutex == nullptr) {
+    return false;
+  }
+  xSemaphoreTake(sharedI2cMutex, portMAX_DELAY);
   Wire.beginTransmission(address);
   Wire.write(reg);
   Wire.write(data, length);
-  return Wire.endTransmission() == 0;
+  const bool success = Wire.endTransmission() == 0;
+  xSemaphoreGive(sharedI2cMutex);
+  return success;
 }
 
 uint8_t bcdToDecimal(uint8_t value) {
@@ -502,10 +649,8 @@ bool readTouchRegisters(uint8_t reg, uint8_t *data, uint8_t length) {
 
 bool configureTouchController() {
   // Match Waveshare's driver: register 0 selects normal operating mode.
-  Wire.beginTransmission(kTouchAddress);
-  Wire.write(kTouchModeRegister);
-  Wire.write(static_cast<uint8_t>(0x00));
-  if (Wire.endTransmission() != 0) {
+  const uint8_t normalMode = 0x00;
+  if (!writeI2cRegisters(kTouchAddress, kTouchModeRegister, &normalMode, 1)) {
     return false;
   }
 
@@ -563,8 +708,43 @@ void handleLongPress() {
 #endif
 }
 
+#if GLOBE_ENABLE_XY_ROTATION
+void setPitchQ8(int32_t requestedValueQ8) {
+  const int16_t constrainedPitchQ8 = static_cast<int16_t>(
+      constrain(requestedValueQ8,
+                static_cast<int32_t>(kMinimumPitchQ8),
+                static_cast<int32_t>(kMaximumPitchQ8)));
+  if (constrainedPitchQ8 == pitchQ8) {
+    return;
+  }
+
+  pitchQ8 = constrainedPitchQ8;
+  portENTER_CRITICAL(&pitchLutMux);
+  requestedPitchQ8 = constrainedPitchQ8;
+  pitchRequestGeneration = pitchRequestGeneration + 1;
+  pitchLastChangeMs = millis();
+  pitchExactReady = false;
+  // Any unpublished map belongs to the previous target. Discard it before
+  // allowing the builder to reuse that preview buffer.
+  pitchSwapPending = false;
+  if (constrainedPitchQ8 == 0) {
+    readyPitchMode = PitchDenseMode::Zero;
+    readyPitchQ8 = 0;
+    readyPitchGeneration = pitchRequestGeneration;
+    pitchSwapPending = true;
+  }
+  portEXIT_CRITICAL(&pitchLutMux);
+  if (pitchBuilderTaskHandle != nullptr) {
+    xTaskNotifyGive(pitchBuilderTaskHandle);
+  }
+}
+#endif
+
 void resetGlobeView() {
   rotationQ16 = 0;
+#if GLOBE_ENABLE_XY_ROTATION
+  setPitchQ8(0);
+#endif
   touchState.freeVelocityQ16PerMs = kAutoRotationVelocityQ16PerMs;
   touchState.dragVelocityQ16PerMs = 0;
 #if GLOBE_ENABLE_SERIAL_STATS
@@ -591,8 +771,12 @@ void updateTouchInteraction(uint32_t now, uint32_t elapsedMs) {
   if (touched) {
     if (!touchState.down) {
       touchState.down = true;
+#if GLOBE_ENABLE_XY_ROTATION
+      pitchTouchActive = true;
+#endif
       touchState.moved = false;
       touchState.dragging = false;
+      touchState.horizontalDragged = false;
       touchState.longPressHandled = false;
       touchState.startX = x;
       touchState.startY = y;
@@ -613,13 +797,17 @@ void updateTouchInteraction(uint32_t now, uint32_t elapsedMs) {
         abs(totalY) > kGestureMoveThreshold) {
       touchState.moved = true;
     }
-    if (abs(totalX) > kGestureMoveThreshold) {
+    if (touchState.moved) {
       touchState.dragging = true;
+    }
+    if (abs(totalX) > kGestureMoveThreshold) {
+      touchState.horizontalDragged = true;
     }
 
     const uint32_t sampleElapsedMs = max<uint32_t>(1, now - touchState.lastSampleMs);
     const int16_t deltaX = x - touchState.lastX;
-    if (touchState.dragging && deltaX != 0) {
+    const int16_t deltaY = y - touchState.lastY;
+    if (touchState.horizontalDragged && deltaX != 0) {
       const int32_t rotationDeltaQ16 =
           -static_cast<int32_t>(deltaX) * kDragSensitivityQ16PerPixel;
       rotationQ16 += static_cast<uint32_t>(rotationDeltaQ16);
@@ -636,6 +824,15 @@ void updateTouchInteraction(uint32_t now, uint32_t elapsedMs) {
       touchState.dragVelocityQ16PerMs =
           (touchState.dragVelocityQ16PerMs * 3) / 4;
     }
+#if GLOBE_ENABLE_XY_ROTATION
+    if (touchState.dragging && deltaY != 0) {
+      // The globe follows the finger: dragging the northern cap downward
+      // increases pitch and brings the north pole toward the viewer.
+      setPitchQ8(static_cast<int32_t>(pitchQ8) +
+                 static_cast<int32_t>(deltaY) *
+                     kPitchSensitivityQ8PerPixel);
+    }
+#endif
 
     if (!touchState.moved && !touchState.longPressHandled &&
         now - touchState.downMs >= kLongPressMs) {
@@ -653,10 +850,12 @@ void updateTouchInteraction(uint32_t now, uint32_t elapsedMs) {
   if (touchState.down) {
     const uint32_t pressDurationMs = now - touchState.downMs;
     if (touchState.dragging) {
-      touchState.freeVelocityQ16PerMs = constrain(
-          touchState.dragVelocityQ16PerMs,
-          -kMaximumInertiaVelocityQ16PerMs,
-          kMaximumInertiaVelocityQ16PerMs);
+      touchState.freeVelocityQ16PerMs =
+          touchState.horizontalDragged
+              ? constrain(touchState.dragVelocityQ16PerMs,
+                          -kMaximumInertiaVelocityQ16PerMs,
+                          kMaximumInertiaVelocityQ16PerMs)
+              : kAutoRotationVelocityQ16PerMs;
       touchState.previousTapValid = false;
     } else if (!touchState.moved && !touchState.longPressHandled &&
                pressDurationMs <= kTapMaximumMs) {
@@ -681,10 +880,22 @@ void updateTouchInteraction(uint32_t now, uint32_t elapsedMs) {
       touchState.freeVelocityQ16PerMs = kAutoRotationVelocityQ16PerMs;
     }
 #if GLOBE_ENABLE_SERIAL_STATS
-    Serial.printf("Touch: up %d,%d%s\n", touchState.lastX, touchState.lastY,
-                  touchState.dragging ? " drag" : "");
+    Serial.printf("Touch: up %d,%d%s, pitch %d deg\n", touchState.lastX,
+                  touchState.lastY, touchState.dragging ? " drag" : "",
+#if GLOBE_ENABLE_XY_ROTATION
+                  pitchQ8 / 256
+#else
+                  0
+#endif
+    );
 #endif
     touchState.down = false;
+#if GLOBE_ENABLE_XY_ROTATION
+    pitchTouchActive = false;
+    if (pitchBuilderTaskHandle != nullptr) {
+      xTaskNotifyGive(pitchBuilderTaskHandle);
+    }
+#endif
   }
 
   if (touchState.previousTapValid &&
@@ -694,6 +905,11 @@ void updateTouchInteraction(uint32_t now, uint32_t elapsedMs) {
 
   // Preserve flick direction and speed after release, then smoothly converge
   // back to the normal automatic rotation instead of stopping abruptly.
+#if GLOBE_ENABLE_SCREENSHOT
+  if (screenshotFreezeRotation) {
+    return;
+  }
+#endif
   rotationQ16 += static_cast<uint32_t>(
       touchState.freeVelocityQ16PerMs * static_cast<int32_t>(elapsedMs));
   const int32_t velocityDifference =
@@ -913,7 +1129,6 @@ void buildSphereLut() {
   // unpacks integer texture coordinates, lighting, and rim values.
   constexpr float kPi = 3.14159265358979323846f;
   constexpr float kTwoPi = kPi * 2.0f;
-
   for (int16_t localY = 0; localY < kLutDiameter; ++localY) {
     const int16_t dy = localY - kGlobeRadius;
     const float rawNy = static_cast<float>(dy) / kGlobeRadius;
@@ -946,6 +1161,9 @@ void buildSphereLut() {
       }
       if (coveredSamples == 0) {
         sphereLut[lutIndex] = 0;
+#if GLOBE_ENABLE_XY_ROTATION
+        sphereNzQ15[lutIndex] = 0;
+#endif
         continue;
       }
       sphereLeft[localY] = min<uint16_t>(sphereLeft[localY], localX);
@@ -963,6 +1181,10 @@ void buildSphereLut() {
         radiusSquared = nx * nx + projectedNy * projectedNy;
       }
       const float nz = sqrtf(max(0.0f, 1.0f - radiusSquared));
+#if GLOBE_ENABLE_XY_ROTATION
+      sphereNzQ15[lutIndex] = static_cast<uint16_t>(
+          lroundf(nz * 32767.0f));
+#endif
       const float longitude = atan2f(nx, nz);
 
       int32_t textureU = static_cast<int32_t>(
@@ -984,9 +1206,835 @@ void buildSphereLut() {
           (static_cast<uint32_t>(textureU) & kUMask) |
           ((shade & kShadeMask) << 10) |
           ((coverage & kCoverageMask) << 14));
+
     }
   }
 }
+
+#if GLOBE_ENABLE_XY_ROTATION && GLOBE_ENABLE_SPAN_REFERENCE
+struct PitchBuilderCoordinate {
+  uint16_t frontUQ6;
+  uint16_t frontVQ6;
+  uint16_t backUQ6;
+  uint16_t backVQ6;
+};
+
+__attribute__((always_inline)) inline uint32_t absoluteDifference(
+    int32_t first, int32_t second) {
+  const int32_t difference = first - second;
+  return static_cast<uint32_t>(difference < 0 ? -difference : difference);
+}
+
+int16_t roundedSpanStep(int32_t difference, uint16_t denominator) {
+  if (denominator == 0) {
+    return 0;
+  }
+  const int32_t rounding = denominator / 2;
+  const int32_t step =
+      difference >= 0
+          ? (difference + rounding) / denominator
+          : (difference - rounding) / denominator;
+  return static_cast<int16_t>(
+      constrain(step, static_cast<int32_t>(INT16_MIN),
+                static_cast<int32_t>(INT16_MAX)));
+}
+
+bool pitchBuildIsCurrent(uint32_t generation) {
+  return pitchRequestGeneration == generation;
+}
+
+void calculatePitchCoordinate(int16_t localX, int16_t localY,
+                              float pitchSin, float pitchCos,
+                              PitchBuilderCoordinate &coordinate) {
+  constexpr float kPi = 3.14159265358979323846f;
+  constexpr float kTwoPi = kPi * 2.0f;
+  const int16_t dx = localX - kGlobeRadius;
+  const int16_t dy = localY - kGlobeRadius;
+  float nx = static_cast<float>(dx) / kGlobeRadius;
+  float projectedNy = constrain(
+      static_cast<float>(dy) / kGlobeRadius, -1.0f, 1.0f);
+  float radiusSquared = nx * nx + projectedNy * projectedNy;
+  if (radiusSquared > 1.0f) {
+    const float normalize = 0.9999f / sqrtf(radiusSquared);
+    nx *= normalize;
+    projectedNy *= normalize;
+    radiusSquared = nx * nx + projectedNy * projectedNy;
+  }
+  const float nz = sqrtf(max(0.0f, 1.0f - radiusSquared));
+  const float worldY = -projectedNy;
+
+  const float frontY =
+      constrain(worldY * pitchCos + nz * pitchSin, -1.0f, 1.0f);
+  const float frontZ = -worldY * pitchSin + nz * pitchCos;
+  const float backY =
+      constrain(worldY * pitchCos - nz * pitchSin, -1.0f, 1.0f);
+  const float backZ = -worldY * pitchSin - nz * pitchCos;
+  const float frontLongitude = atan2f(nx, frontZ);
+  const float frontLatitude = asinf(frontY);
+  const float backLongitude = atan2f(nx, backZ);
+  const float backLatitude = asinf(backY);
+
+  const int32_t frontUQ6 = lroundf(
+      (frontLongitude / kTwoPi + 0.5f) *
+      globe_texture::kWidth * kPitchCoordinateOne);
+  const int32_t frontVQ6 = lroundf(
+      (0.5f - frontLatitude / kPi) *
+      globe_texture::kHeight * kPitchCoordinateOne);
+  const int32_t backUQ6 = lroundf(
+      (backLongitude / kTwoPi + 0.5f) *
+      world_back_texture::kWidth * kPitchCoordinateOne);
+  const int32_t backVQ6 = lroundf(
+      (0.5f - backLatitude / kPi) *
+      world_back_texture::kHeight * kPitchCoordinateOne);
+
+  coordinate.frontUQ6 = static_cast<uint16_t>(
+      frontUQ6 & ((globe_texture::kWidth * kPitchCoordinateOne) - 1));
+  coordinate.frontVQ6 = static_cast<uint16_t>(constrain(
+      frontVQ6, 0,
+      globe_texture::kHeight * kPitchCoordinateOne - 1));
+  coordinate.backUQ6 = static_cast<uint16_t>(
+      backUQ6 &
+      ((world_back_texture::kWidth * kPitchCoordinateOne) - 1));
+  coordinate.backVQ6 = static_cast<uint16_t>(constrain(
+      backVQ6, 0,
+      world_back_texture::kHeight * kPitchCoordinateOne - 1));
+}
+
+uint32_t pitchCoordinateLineError(
+    const PitchBuilderCoordinate &start,
+    const PitchBuilderCoordinate &end,
+    const PitchBuilderCoordinate &sample, uint16_t numerator,
+    uint16_t denominator) {
+  uint32_t maximumError = 0;
+#define UPDATE_PITCH_ERROR(field)                                           \
+  do {                                                                      \
+    const int32_t predicted =                                               \
+        static_cast<int32_t>(start.field) +                                 \
+        ((static_cast<int32_t>(end.field) - start.field) * numerator +      \
+         denominator / 2) /                                                 \
+            denominator;                                                    \
+    maximumError = max<uint32_t>(                                           \
+        maximumError, absoluteDifference(predicted, sample.field));         \
+  } while (false)
+  UPDATE_PITCH_ERROR(frontUQ6);
+  UPDATE_PITCH_ERROR(frontVQ6);
+  UPDATE_PITCH_ERROR(backUQ6);
+  UPDATE_PITCH_ERROR(backVQ6);
+#undef UPDATE_PITCH_ERROR
+  return maximumError;
+}
+
+bool appendPitchSpan(PitchSpanLut &lut,
+                     const PitchBuilderCoordinate &start,
+                     const PitchBuilderCoordinate &end,
+                     uint16_t interpolationDistance,
+                     uint16_t pixelCount) {
+  if (lut.spanCount >= kPitchSpanCapacity || pixelCount == 0) {
+    return false;
+  }
+  PitchSpan &span = lut.spans[lut.spanCount++];
+  span.frontUQ6 = start.frontUQ6;
+  span.frontVQ6 = start.frontVQ6;
+  span.backUQ6 = start.backUQ6;
+  span.backVQ6 = start.backVQ6;
+  span.frontUStepQ6 = roundedSpanStep(
+      static_cast<int32_t>(end.frontUQ6) - start.frontUQ6,
+      interpolationDistance);
+  span.frontVStepQ6 = roundedSpanStep(
+      static_cast<int32_t>(end.frontVQ6) - start.frontVQ6,
+      interpolationDistance);
+  span.backUStepQ6 = roundedSpanStep(
+      static_cast<int32_t>(end.backUQ6) - start.backUQ6,
+      interpolationDistance);
+  span.backVStepQ6 = roundedSpanStep(
+      static_cast<int32_t>(end.backVQ6) - start.backVQ6,
+      interpolationDistance);
+  span.pixelCount = pixelCount;
+  return true;
+}
+
+bool pitchSpanWithinError(PitchBuilderCoordinate *coordinates,
+                          uint16_t start, uint16_t end) {
+  if (end <= start + 1) {
+    return true;
+  }
+  const uint16_t denominator = end - start;
+  for (uint16_t index = start + 1; index < end; ++index) {
+    if (pitchCoordinateLineError(
+            coordinates[start], coordinates[end], coordinates[index],
+            index - start, denominator) > kPitchSpanErrorQ6) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool appendAdaptivePitchRun(PitchSpanLut &lut,
+                            PitchBuilderCoordinate *coordinates,
+                            uint16_t runStart, uint16_t runEnd) {
+  if (runStart == runEnd) {
+    return appendPitchSpan(lut, coordinates[runStart],
+                           coordinates[runStart], 0, 1);
+  }
+
+  uint16_t segmentStart = runStart;
+  while (segmentStart < runEnd) {
+    uint16_t segmentEnd = min<uint16_t>(
+        runEnd, segmentStart + kMaximumPitchSpanPixels);
+    while (segmentEnd > segmentStart + 1 &&
+           !pitchSpanWithinError(coordinates, segmentStart, segmentEnd)) {
+      segmentEnd =
+          segmentStart + max<uint16_t>(1, (segmentEnd - segmentStart) / 2);
+    }
+    const bool finalSegment = segmentEnd == runEnd;
+    const uint16_t distance = segmentEnd - segmentStart;
+    const uint16_t pixelCount =
+        distance + static_cast<uint16_t>(finalSegment);
+    if (!appendPitchSpan(lut, coordinates[segmentStart],
+                         coordinates[segmentEnd], distance, pixelCount)) {
+      return false;
+    }
+    segmentStart = segmentEnd;
+  }
+  return true;
+}
+
+bool buildPitchSpanLut(PitchSpanLut &lut, int16_t targetPitchQ8,
+                       uint32_t generation) {
+  constexpr float kPi = 3.14159265358979323846f;
+  const uint32_t buildStartUs = micros();
+  const float pitchRadians =
+      (static_cast<float>(targetPitchQ8) / 256.0f) * kPi / 180.0f;
+  const float pitchSin = sinf(pitchRadians);
+  const float pitchCos = cosf(pitchRadians);
+  PitchBuilderCoordinate coordinates[kLutDiameter];
+  lut.spanCount = 0;
+  lut.pitchQ8 = targetPitchQ8;
+
+  constexpr uint32_t kFrontHalfPeriodQ6 =
+      globe_texture::kWidth * kPitchCoordinateOne / 2;
+  constexpr uint32_t kBackHalfPeriodQ6 =
+      world_back_texture::kWidth * kPitchCoordinateOne / 2;
+
+  for (uint16_t localY = 0; localY < kLutDiameter; ++localY) {
+    if (!pitchBuildIsCurrent(generation)) {
+      return false;
+    }
+    PitchSpanRow &row = lut.rows[localY];
+    row.firstSpan = lut.spanCount;
+    row.spanCount = 0;
+    row.reserved = 0;
+    const uint16_t left = sphereLeft[localY];
+    const uint16_t right = sphereRight[localY];
+    if (left > right) {
+      continue;
+    }
+    const uint16_t pixelCount = right - left + 1;
+    for (uint16_t pixel = 0; pixel < pixelCount; ++pixel) {
+      calculatePitchCoordinate(left + pixel, localY, pitchSin,
+                               pitchCos, coordinates[pixel]);
+    }
+
+    uint16_t runStart = 0;
+    for (uint16_t pixel = 1; pixel <= pixelCount; ++pixel) {
+      bool endRun = pixel == pixelCount;
+      if (!endRun) {
+        endRun =
+            absoluteDifference(coordinates[pixel].frontUQ6,
+                               coordinates[pixel - 1].frontUQ6) >
+                kFrontHalfPeriodQ6 ||
+            absoluteDifference(coordinates[pixel].backUQ6,
+                               coordinates[pixel - 1].backUQ6) >
+                kBackHalfPeriodQ6;
+      }
+      if (!endRun) {
+        continue;
+      }
+      if (!appendAdaptivePitchRun(lut, coordinates, runStart,
+                                  pixel - 1)) {
+        return false;
+      }
+      runStart = pixel;
+    }
+    const uint16_t rowSpanCount = lut.spanCount - row.firstSpan;
+    if (rowSpanCount > kMaximumPitchSpansPerRow) {
+      return false;
+    }
+    row.spanCount = static_cast<uint8_t>(rowSpanCount);
+    if ((localY & 3U) == 3U) {
+      // Block briefly instead of only yielding to equal-priority tasks. This
+      // lets IDLE0 run and service the core watchdog while display transfer,
+      // which has higher priority, remains responsive.
+      vTaskDelay(1);
+    }
+  }
+  lut.buildMicros = micros() - buildStartUs;
+  return pitchBuildIsCurrent(generation);
+}
+
+void spanReferencePitchBuilderTask(void *parameter) {
+  while (true) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    while (true) {
+      int16_t targetPitchQ8;
+      uint32_t generation;
+      int8_t activeIndex;
+      int8_t readyIndex;
+      portENTER_CRITICAL(&pitchLutMux);
+      targetPitchQ8 = requestedPitchQ8;
+      generation = pitchRequestGeneration;
+      activeIndex = activePitchLutIndex;
+      readyIndex = readyPitchLutIndex;
+      portEXIT_CRITICAL(&pitchLutMux);
+
+      if (targetPitchQ8 == 0) {
+        break;
+      }
+      if (readyIndex >= 0) {
+        vTaskDelay(1);
+        continue;
+      }
+      const int8_t buildIndex = activeIndex == 0 ? 1 : 0;
+      PitchSpanLut &buildLut = pitchSpanLuts[buildIndex];
+      if (!buildPitchSpanLut(buildLut, targetPitchQ8, generation)) {
+        if (!pitchBuildIsCurrent(generation)) {
+          continue;
+        }
+#if GLOBE_ENABLE_SERIAL_STATS
+        Serial.printf("Pitch LUT build failed at %u spans\n",
+                      buildLut.spanCount);
+#endif
+        break;
+      }
+
+      portENTER_CRITICAL(&pitchLutMux);
+      if (pitchRequestGeneration == generation &&
+          requestedPitchQ8 == targetPitchQ8 &&
+          readyPitchLutIndex < 0) {
+        readyPitchLutIndex = buildIndex;
+      }
+      portEXIT_CRITICAL(&pitchLutMux);
+#if GLOBE_ENABLE_SERIAL_STATS
+      Serial.printf("Pitch LUT: %.2f deg, %u spans, %lu.%03lu ms\n",
+                    targetPitchQ8 / 256.0f, buildLut.spanCount,
+                    buildLut.buildMicros / 1000,
+                    buildLut.buildMicros % 1000);
+#endif
+      break;
+    }
+  }
+}
+
+void activateReadyPitchSpanLutReference() {
+  int8_t readyIndex = -1;
+  portENTER_CRITICAL(&pitchLutMux);
+  if (readyPitchLutIndex >= 0) {
+    readyIndex = readyPitchLutIndex;
+    readyPitchLutIndex = -1;
+    if (requestedPitchQ8 != 0 &&
+        pitchSpanLuts[readyIndex].pitchQ8 == requestedPitchQ8) {
+      activePitchLutIndex = readyIndex;
+    } else {
+      readyIndex = -1;
+    }
+  }
+  portEXIT_CRITICAL(&pitchLutMux);
+  if (readyIndex >= 0) {
+    renderedPitchQ8 = pitchSpanLuts[readyIndex].pitchQ8;
+  }
+}
+#endif
+
+#if GLOBE_ENABLE_XY_ROTATION
+struct DensePitchCoordinates {
+  uint16_t frontU;
+  uint16_t frontV;
+  uint16_t backU;
+  uint16_t backV;
+};
+
+void writePreviewPitchCoordinate(uint8_t *destination, uint16_t frontU,
+                                 uint16_t frontV) {
+  destination[0] = static_cast<uint8_t>(frontU);
+  destination[1] = static_cast<uint8_t>(
+      ((frontU >> 8) & 0x03U) | ((frontV & 0x3FU) << 2));
+  destination[2] = static_cast<uint8_t>((frontV >> 6) & 0x07U);
+}
+
+__attribute__((always_inline)) inline void readPreviewPitchCoordinate(
+    const uint8_t *__restrict__ source, uint16_t &frontU,
+    uint16_t &frontV) {
+  frontU = static_cast<uint16_t>(
+      source[0] | ((source[1] & 0x03U) << 8));
+  frontV = static_cast<uint16_t>(
+      (source[1] >> 2) | ((source[2] & 0x07U) << 6));
+}
+
+void writeExactPitchCoordinate(uint8_t *destination,
+                               const DensePitchCoordinates &coordinate) {
+  destination[0] = static_cast<uint8_t>(coordinate.frontU);
+  destination[1] = static_cast<uint8_t>(
+      ((coordinate.frontU >> 8) & 0x03U) |
+      ((coordinate.frontV & 0x3FU) << 2));
+  destination[2] = static_cast<uint8_t>(
+      ((coordinate.frontV >> 6) & 0x07U) |
+      ((coordinate.backU & 0x1FU) << 3));
+  destination[3] = static_cast<uint8_t>(
+      ((coordinate.backU >> 5) & 0x1FU) |
+      ((coordinate.backV & 0x07U) << 5));
+  destination[4] =
+      static_cast<uint8_t>((coordinate.backV >> 3) & 0x3FU);
+}
+
+__attribute__((always_inline)) inline DensePitchCoordinates
+readExactPitchCoordinate(const uint8_t *__restrict__ source) {
+  DensePitchCoordinates coordinate;
+  coordinate.frontU = static_cast<uint16_t>(
+      source[0] | ((source[1] & 0x03U) << 8));
+  coordinate.frontV = static_cast<uint16_t>(
+      (source[1] >> 2) | ((source[2] & 0x07U) << 6));
+  coordinate.backU = static_cast<uint16_t>(
+      (source[2] >> 3) | ((source[3] & 0x1FU) << 5));
+  coordinate.backV = static_cast<uint16_t>(
+      (source[3] >> 5) | ((source[4] & 0x3FU) << 3));
+  return coordinate;
+}
+
+void buildProjectionTrigLuts() {
+  constexpr float kPi = 3.14159265358979323846f;
+  for (uint16_t index = 0; index < kProjectionTrigLutSize; ++index) {
+    const float unit =
+        static_cast<float>(index) / (kProjectionTrigLutSize - 1);
+    const float y = unit * 2.0f - 1.0f;
+    projectionAsinVLut[index] = static_cast<uint16_t>(constrain(
+        static_cast<int32_t>(
+            lroundf((0.5f - asinf(y) / kPi) *
+                    globe_texture::kHeight)),
+        0, globe_texture::kHeight - 1));
+    projectionAtanULut[index] = static_cast<uint16_t>(lroundf(
+        atanf(unit) * globe_texture::kWidth / (2.0f * kPi)));
+  }
+}
+
+__attribute__((always_inline)) inline uint16_t fastLatitudeV(float y) {
+  const int32_t index = constrain(
+      static_cast<int32_t>(lroundf((y + 1.0f) *
+                                   (kProjectionTrigLutSize - 1) * 0.5f)),
+      0, kProjectionTrigLutSize - 1);
+  return projectionAsinVLut[index];
+}
+
+__attribute__((always_inline)) inline uint16_t fastLongitudeU(float x,
+                                                              float z) {
+  const float absoluteX = fabsf(x);
+  const float absoluteZ = fabsf(z);
+  uint16_t firstQuadrantU;
+  if (absoluteX == 0.0f && absoluteZ == 0.0f) {
+    firstQuadrantU = 0;
+  } else if (absoluteZ >= absoluteX) {
+    const uint16_t ratioIndex = static_cast<uint16_t>(constrain(
+        static_cast<int32_t>(
+            lroundf(absoluteX / max(absoluteZ, 1.0e-9f) *
+                    (kProjectionTrigLutSize - 1))),
+        0, kProjectionTrigLutSize - 1));
+    firstQuadrantU = projectionAtanULut[ratioIndex];
+  } else {
+    const uint16_t ratioIndex = static_cast<uint16_t>(constrain(
+        static_cast<int32_t>(
+            lroundf(absoluteZ / max(absoluteX, 1.0e-9f) *
+                    (kProjectionTrigLutSize - 1))),
+        0, kProjectionTrigLutSize - 1));
+    firstQuadrantU =
+        globe_texture::kWidth / 4U - projectionAtanULut[ratioIndex];
+  }
+
+  int32_t signedU;
+  if (z >= 0.0f) {
+    signedU = x >= 0.0f ? firstQuadrantU : -firstQuadrantU;
+  } else {
+    signedU =
+        x >= 0.0f
+            ? static_cast<int32_t>(globe_texture::kWidth / 2U) -
+                  firstQuadrantU
+            : -static_cast<int32_t>(globe_texture::kWidth / 2U) +
+                  firstQuadrantU;
+  }
+  return static_cast<uint16_t>(
+      signedU + globe_texture::kWidth / 2U) &
+         kPitchFrontUMask;
+}
+
+void calculateDensePitchCoordinate(int16_t localX, int16_t localY,
+                                   uint32_t lutIndex,
+                                   float pitchSin, float pitchCos,
+                                   DensePitchCoordinates &coordinate) {
+  const int16_t dx = localX - kGlobeRadius;
+  const int16_t dy = localY - kGlobeRadius;
+  constexpr float kInverseGlobeRadius = 1.0f / kGlobeRadius;
+  float nx = static_cast<float>(dx) * kInverseGlobeRadius;
+  float projectedNy = constrain(
+      static_cast<float>(dy) * kInverseGlobeRadius, -1.0f, 1.0f);
+  float radiusSquared = nx * nx + projectedNy * projectedNy;
+  float nz;
+  if (radiusSquared > 1.0f) {
+    const float normalize = 0.9999f / sqrtf(radiusSquared);
+    nx *= normalize;
+    projectedNy *= normalize;
+    radiusSquared = nx * nx + projectedNy * projectedNy;
+    nz = sqrtf(max(0.0f, 1.0f - radiusSquared));
+  } else {
+    nz = sphereNzQ15[lutIndex] * (1.0f / 32767.0f);
+  }
+  const float worldY = -projectedNy;
+  const float frontY =
+      constrain(worldY * pitchCos + nz * pitchSin, -1.0f, 1.0f);
+  const float frontZ = -worldY * pitchSin + nz * pitchCos;
+  const float backY =
+      constrain(worldY * pitchCos - nz * pitchSin, -1.0f, 1.0f);
+  const float backZ = -worldY * pitchSin - nz * pitchCos;
+  coordinate.frontU = fastLongitudeU(nx, frontZ);
+  coordinate.frontV = fastLatitudeV(frontY);
+  coordinate.backU = fastLongitudeU(nx, backZ);
+  coordinate.backV = fastLatitudeV(backY);
+}
+
+void readPitchAnchorCoordinate(uint8_t anchorIndex, uint32_t lutIndex,
+                               int16_t localY, uint16_t &frontU,
+                               uint16_t &frontV) {
+  if (anchorIndex == kZeroPitchAnchorIndex) {
+    frontU = sphereLut[lutIndex] & kUMask;
+    frontV = sphereV[localY];
+    return;
+  }
+  readPreviewPitchCoordinate(
+      pitchAnchorMaps[anchorIndex] +
+          lutIndex * kPitchPreviewBytesPerPixel,
+      frontU, frontV);
+}
+
+void buildPitchAnchorBank() {
+  constexpr float kPi = 3.14159265358979323846f;
+  for (uint8_t anchorIndex = 0; anchorIndex < kPitchAnchorCount;
+       ++anchorIndex) {
+    if (anchorIndex == kZeroPitchAnchorIndex) {
+      continue;
+    }
+    const float radians =
+        kPitchAnchorDegrees[anchorIndex] * kPi / 180.0f;
+    const float pitchSin = sinf(radians);
+    const float pitchCos = cosf(radians);
+    for (uint16_t localY = 0; localY < kLutDiameter; ++localY) {
+      const uint16_t left = sphereLeft[localY];
+      const uint16_t right = sphereRight[localY];
+      if (left > right) {
+        continue;
+      }
+      for (uint16_t localX = left; localX <= right; ++localX) {
+        const uint32_t lutIndex =
+            static_cast<uint32_t>(localY) * kLutDiameter + localX;
+        DensePitchCoordinates coordinate;
+        calculateDensePitchCoordinate(localX, localY, lutIndex, pitchSin,
+                                      pitchCos, coordinate);
+        writePreviewPitchCoordinate(
+            pitchAnchorMaps[anchorIndex] +
+                lutIndex * kPitchPreviewBytesPerPixel,
+            coordinate.frontU, coordinate.frontV);
+      }
+    }
+  }
+}
+
+void selectPitchAnchors(int16_t targetPitchQ8, uint8_t &lowerIndex,
+                        uint8_t &upperIndex, uint8_t &blendQ8) {
+  lowerIndex = kPitchAnchorCount - 1;
+  for (uint8_t index = 0; index + 1 < kPitchAnchorCount; ++index) {
+    if (targetPitchQ8 < kPitchAnchorDegrees[index + 1] * 256) {
+      lowerIndex = index;
+      break;
+    }
+  }
+  if (lowerIndex + 1 >= kPitchAnchorCount) {
+    upperIndex = lowerIndex;
+    blendQ8 = 0;
+    return;
+  }
+  upperIndex = lowerIndex + 1;
+  const int32_t lowerQ8 = kPitchAnchorDegrees[lowerIndex] * 256;
+  const int32_t upperQ8 = kPitchAnchorDegrees[upperIndex] * 256;
+  blendQ8 = static_cast<uint8_t>(
+      (static_cast<int32_t>(targetPitchQ8) - lowerQ8) * 256 /
+      (upperQ8 - lowerQ8));
+}
+
+bool densePitchRequestIsCurrent(uint32_t generation) {
+  return pitchRequestGeneration == generation;
+}
+
+bool buildPitchPreviewMap(uint8_t *destination, int16_t targetPitchQ8,
+                          uint32_t generation) {
+  const uint32_t buildStartUs = micros();
+  uint8_t lowerIndex;
+  uint8_t upperIndex;
+  uint8_t blendQ8;
+  selectPitchAnchors(targetPitchQ8, lowerIndex, upperIndex, blendQ8);
+  if (lowerIndex == upperIndex || blendQ8 == 0) {
+    if (lowerIndex == kZeroPitchAnchorIndex) {
+      // Zero pitch is routed to the original fast renderer and never needs a
+      // synthesized dense map.
+      return false;
+    }
+    memcpy(destination, pitchAnchorMaps[lowerIndex],
+           static_cast<size_t>(kLutDiameter) * kLutDiameter *
+               kPitchPreviewBytesPerPixel);
+    pitchPreviewBuildMicros = micros() - buildStartUs;
+    return densePitchRequestIsCurrent(generation);
+  }
+  constexpr float kPi = 3.14159265358979323846f;
+  const float pitchRadians =
+      (static_cast<float>(targetPitchQ8) / 256.0f) * kPi / 180.0f;
+  const float pitchSin = sinf(pitchRadians);
+  const float pitchCos = cosf(pitchRadians);
+  const int16_t visiblePoleLocalY = static_cast<int16_t>(lroundf(
+      kGlobeRadius -
+      copysignf(pitchCos * kGlobeRadius,
+                static_cast<float>(targetPitchQ8))));
+  constexpr int16_t kPreviewPoleRepairRadius = 64;
+  constexpr int32_t kPreviewPoleRepairRadiusSquared =
+      kPreviewPoleRepairRadius * kPreviewPoleRepairRadius;
+  for (uint16_t localY = 0; localY < kLutDiameter; ++localY) {
+    if (!densePitchRequestIsCurrent(generation)) {
+      return false;
+    }
+    const uint16_t left = sphereLeft[localY];
+    const uint16_t right = sphereRight[localY];
+    if (left > right) {
+      continue;
+    }
+    for (uint16_t localX = left; localX <= right; ++localX) {
+      const uint32_t lutIndex =
+          static_cast<uint32_t>(localY) * kLutDiameter + localX;
+      uint16_t lowerU;
+      uint16_t lowerV;
+      uint16_t upperU;
+      uint16_t upperV;
+      readPitchAnchorCoordinate(lowerIndex, lutIndex, localY, lowerU,
+                                lowerV);
+      readPitchAnchorCoordinate(upperIndex, lutIndex, localY, upperU,
+                                upperV);
+      const int32_t wrappedDeltaU =
+          ((upperU - lowerU + globe_texture::kWidth / 2) &
+           (globe_texture::kWidth - 1)) -
+          globe_texture::kWidth / 2;
+      uint16_t frontU = static_cast<uint16_t>(
+          lowerU + ((wrappedDeltaU * blendQ8 + 128) >> 8)) &
+          kPitchFrontUMask;
+      uint16_t frontV = static_cast<uint16_t>(
+          lowerV +
+          (((static_cast<int32_t>(upperV) - lowerV) * blendQ8 + 128) >>
+           8));
+      const int16_t poleDx = localX - kGlobeRadius;
+      const int16_t poleDy = localY - visiblePoleLocalY;
+      const int32_t poleDistanceSquared =
+          static_cast<int32_t>(poleDx) * poleDx +
+          static_cast<int32_t>(poleDy) * poleDy;
+      if (poleDistanceSquared <= kPreviewPoleRepairRadiusSquared) {
+        // Longitude is singular at a visible pole. UV interpolation cannot
+        // represent that topology even when wrapping is circular. Blend an
+        // accelerated exact projection into the pole core and taper it to the
+        // ordinary preview at the patch boundary.
+        DensePitchCoordinates exact;
+        calculateDensePitchCoordinate(localX, localY, lutIndex, pitchSin,
+                                      pitchCos, exact);
+        constexpr int32_t kFullRepairRadiusSquared = 28 * 28;
+        const uint16_t repairQ8 = static_cast<uint16_t>(constrain(
+            (kPreviewPoleRepairRadiusSquared - poleDistanceSquared) *
+                256 /
+                (kPreviewPoleRepairRadiusSquared -
+                 kFullRepairRadiusSquared),
+            0, 256));
+        const int32_t exactDeltaU =
+            ((exact.frontU - frontU + globe_texture::kWidth / 2) &
+             (globe_texture::kWidth - 1)) -
+            globe_texture::kWidth / 2;
+        frontU = static_cast<uint16_t>(
+            frontU + ((exactDeltaU * repairQ8 + 128) >> 8)) &
+            kPitchFrontUMask;
+        frontV = static_cast<uint16_t>(
+            frontV +
+            (((static_cast<int32_t>(exact.frontV) - frontV) *
+                  repairQ8 +
+              128) >>
+             8));
+      }
+      writePreviewPitchCoordinate(
+          destination + lutIndex * kPitchPreviewBytesPerPixel, frontU,
+          frontV);
+    }
+    if ((localY & 15U) == 15U) {
+      vTaskDelay(1);
+    }
+  }
+  pitchPreviewBuildMicros = micros() - buildStartUs;
+  return densePitchRequestIsCurrent(generation);
+}
+
+bool buildPitchExactMap(uint8_t *destination, int16_t targetPitchQ8,
+                        uint32_t generation) {
+  constexpr float kPi = 3.14159265358979323846f;
+  const uint32_t buildStartUs = micros();
+  const float radians =
+      (static_cast<float>(targetPitchQ8) / 256.0f) * kPi / 180.0f;
+  const float pitchSin = sinf(radians);
+  const float pitchCos = cosf(radians);
+  for (uint16_t localY = 0; localY < kLutDiameter; ++localY) {
+    if (!densePitchRequestIsCurrent(generation)) {
+      return false;
+    }
+    const uint16_t left = sphereLeft[localY];
+    const uint16_t right = sphereRight[localY];
+    if (left > right) {
+      continue;
+    }
+    for (uint16_t localX = left; localX <= right; ++localX) {
+      const uint32_t lutIndex =
+          static_cast<uint32_t>(localY) * kLutDiameter + localX;
+      DensePitchCoordinates coordinate;
+      calculateDensePitchCoordinate(localX, localY, lutIndex, pitchSin,
+                                    pitchCos, coordinate);
+      writeExactPitchCoordinate(
+          destination + lutIndex * kPitchExactBytesPerPixel, coordinate);
+    }
+    if ((localY & 7U) == 7U) {
+      vTaskDelay(1);
+    }
+  }
+  pitchExactBuildMicros = micros() - buildStartUs;
+  return densePitchRequestIsCurrent(generation);
+}
+
+void publishPitchSwap(PitchDenseMode mode, int8_t previewIndex,
+                      int16_t pitchValueQ8, uint32_t generation) {
+  portENTER_CRITICAL(&pitchLutMux);
+  if (generation == pitchRequestGeneration &&
+      pitchValueQ8 == requestedPitchQ8) {
+    readyPitchMode = mode;
+    readyPreviewMapIndex = previewIndex;
+    readyPitchQ8 = pitchValueQ8;
+    readyPitchGeneration = generation;
+    pitchSwapPending = true;
+  }
+  portEXIT_CRITICAL(&pitchLutMux);
+}
+
+void pitchBuilderTask(void *parameter) {
+  while (true) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    while (true) {
+      int16_t targetPitchQ8;
+      uint32_t generation;
+      int8_t activePreviewIndex;
+      portENTER_CRITICAL(&pitchLutMux);
+      targetPitchQ8 = requestedPitchQ8;
+      generation = pitchRequestGeneration;
+      activePreviewIndex = activePreviewMapIndex;
+      portEXIT_CRITICAL(&pitchLutMux);
+      if (targetPitchQ8 == 0) {
+        break;
+      }
+
+#if GLOBE_ENABLE_SCREENSHOT
+      const bool forceSynthesizedPreview =
+          screenshotForcePitchPreview &&
+          !screenshotForcePitchAnchorBlend;
+#else
+      constexpr bool forceSynthesizedPreview = false;
+#endif
+
+      // A buffer published for the current target must be consumed at a frame
+      // boundary before it can be selected as the next inactive build buffer.
+      while (densePitchRequestIsCurrent(generation) && pitchSwapPending) {
+        vTaskDelay(1);
+      }
+      if (!densePitchRequestIsCurrent(generation)) {
+        continue;
+      }
+      if (forceSynthesizedPreview) {
+        const int8_t buildPreviewIndex =
+            activePreviewIndex == 0 ? 1 : 0;
+        if (!buildPitchPreviewMap(pitchPreviewMaps[buildPreviewIndex],
+                                  targetPitchQ8, generation)) {
+          continue;
+        }
+        publishPitchSwap(PitchDenseMode::Preview, buildPreviewIndex,
+                         targetPitchQ8, generation);
+
+        while (densePitchRequestIsCurrent(generation) &&
+               !(activePitchMode == PitchDenseMode::Preview &&
+                 renderedPitchQ8 == targetPitchQ8)) {
+          vTaskDelay(1);
+        }
+        if (!densePitchRequestIsCurrent(generation)) {
+          continue;
+        }
+      }
+
+      while (densePitchRequestIsCurrent(generation) &&
+             pitchTouchActive &&
+             millis() - pitchLastChangeMs < kPitchExactStabilityMs) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+      }
+      if (!densePitchRequestIsCurrent(generation)) {
+        continue;
+      }
+      if (!buildPitchExactMap(pitchExactMap, targetPitchQ8,
+                              generation)) {
+        continue;
+      }
+      pitchExactReady = true;
+
+      while (densePitchRequestIsCurrent(generation) &&
+             (pitchTouchActive
+#if GLOBE_ENABLE_SCREENSHOT
+              || screenshotForcePitchPreview ||
+              screenshotForcePitchAnchorBlend
+#endif
+              )) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+      }
+      if (!densePitchRequestIsCurrent(generation)) {
+        continue;
+      }
+      publishPitchSwap(PitchDenseMode::Exact, -1, targetPitchQ8,
+                       generation);
+      break;
+    }
+  }
+}
+
+void activateReadyPitchLut() {
+  if (!pitchSwapPending) {
+    return;
+  }
+  portENTER_CRITICAL(&pitchLutMux);
+  if (pitchSwapPending) {
+    if (readyPitchGeneration == pitchRequestGeneration &&
+        readyPitchQ8 == requestedPitchQ8) {
+      if (readyPitchMode == PitchDenseMode::Preview) {
+        activePreviewMapIndex = readyPreviewMapIndex;
+      }
+      activePitchMode = readyPitchMode;
+      renderedPitchQ8 = readyPitchQ8;
+      if (readyPitchMode == PitchDenseMode::Exact) {
+        pitchExactActivatedMs = millis();
+      } else if (readyPitchMode == PitchDenseMode::Zero) {
+        pitchExactActivatedMs = 0;
+      }
+    }
+    pitchSwapPending = false;
+  }
+  portEXIT_CRITICAL(&pitchLutMux);
+}
+#endif
 
 void initializeBackground(uint16_t *buffer, int16_t width, int16_t height,
                           int16_t screenOriginX, int16_t screenOriginY) {
@@ -1530,6 +2578,35 @@ void sendDetailedPerformanceSnapshot() {
   Serial.flush();
 }
 
+void sendPitchStatus() {
+  // "GLBT", target/rendered pitch Q8, active mode, exact-ready flag,
+  // active preview index (255 means none), last rendered mode, and the most
+  // recent preview/exact build times. Capture tools use this only on demand.
+  Serial.write(reinterpret_cast<const uint8_t *>("GLBT"), 4);
+#if GLOBE_ENABLE_XY_ROTATION
+  writeLittleEndian16(static_cast<uint16_t>(pitchQ8));
+  writeLittleEndian16(static_cast<uint16_t>(renderedPitchQ8));
+  Serial.write(static_cast<uint8_t>(activePitchMode));
+  Serial.write(static_cast<uint8_t>(pitchExactReady));
+  Serial.write(activePreviewMapIndex >= 0
+                   ? static_cast<uint8_t>(activePreviewMapIndex)
+                   : 0xFFU);
+  Serial.write(static_cast<uint8_t>(lastRenderedPitchMode));
+  writeLittleEndian32(pitchPreviewBuildMicros);
+  writeLittleEndian32(pitchExactBuildMicros);
+#else
+  writeLittleEndian16(0);
+  writeLittleEndian16(0);
+  Serial.write(static_cast<uint8_t>(0));
+  Serial.write(static_cast<uint8_t>(0));
+  Serial.write(static_cast<uint8_t>(0xFF));
+  Serial.write(static_cast<uint8_t>(0));
+  writeLittleEndian32(0);
+  writeLittleEndian32(0);
+#endif
+  Serial.flush();
+}
+
 void serviceSerialCommands() {
   while (Serial.available() > 0) {
     const int command = Serial.read();
@@ -1539,11 +2616,89 @@ void serviceSerialCommands() {
       sendPerformanceSnapshot();
     } else if (command == 'Q' || command == 'q') {
       sendDetailedPerformanceSnapshot();
+    } else if (command == 'T' || command == 't') {
+      sendPitchStatus();
+#if GLOBE_ENABLE_SERIAL_STATS
+    } else if (command == 'I' || command == 'i') {
+      Serial.printf(
+          "Pitch target/rendered: %.2f/%.2f deg, mode: %u, "
+          "preview/exact build: %.1f/%.1f ms, "
+          "free PSRAM: %u bytes\n",
+#if GLOBE_ENABLE_XY_ROTATION
+          pitchQ8 / 256.0f, renderedPitchQ8 / 256.0f,
+          static_cast<uint8_t>(activePitchMode),
+          pitchPreviewBuildMicros / 1000.0f,
+          pitchExactBuildMicros / 1000.0f,
+#else
+          0.0f, 0.0f, 0, 0.0f, 0.0f,
+#endif
+          ESP.getFreePsram());
+#endif
     } else if (command == 'M' || command == 'm') {
       handleLongPress();
     } else if (command >= '1' && command <= '4') {
       clockMode = static_cast<ClockMode>(command - '1');
       clockOverlayDirty = true;
+    } else if (command == '0') {
+      resetGlobeView();
+      screenshotFreezeRotation = true;
+    } else if (command == 'F' || command == 'f') {
+      screenshotFreezeRotation = !screenshotFreezeRotation;
+    } else if (command == 'B' || command == 'b') {
+      screenshotBackHemisphereEnabled =
+          !screenshotBackHemisphereEnabled;
+#if GLOBE_ENABLE_XY_ROTATION
+    } else if (command == 'A' || command == 'a') {
+      screenshotForcePitchAnchorBlend = true;
+      screenshotForcePitchPreview = false;
+      if (pitchQ8 != 0) {
+        portENTER_CRITICAL(&pitchLutMux);
+        pitchRequestGeneration = pitchRequestGeneration + 1;
+        pitchLastChangeMs = millis();
+        pitchExactReady = false;
+        pitchSwapPending = false;
+        portEXIT_CRITICAL(&pitchLutMux);
+        if (pitchBuilderTaskHandle != nullptr) {
+          xTaskNotifyGive(pitchBuilderTaskHandle);
+        }
+      }
+    } else if (command == 'V' || command == 'v') {
+      screenshotForcePitchPreview = true;
+      screenshotForcePitchAnchorBlend = false;
+      if (pitchQ8 != 0) {
+        portENTER_CRITICAL(&pitchLutMux);
+        pitchRequestGeneration = pitchRequestGeneration + 1;
+        pitchLastChangeMs = millis();
+        pitchExactReady = false;
+        pitchSwapPending = false;
+        portEXIT_CRITICAL(&pitchLutMux);
+        if (pitchBuilderTaskHandle != nullptr) {
+          xTaskNotifyGive(pitchBuilderTaskHandle);
+        }
+      }
+    } else if (command == 'X' || command == 'x') {
+      screenshotForcePitchPreview = false;
+      screenshotForcePitchAnchorBlend = false;
+      if (pitchBuilderTaskHandle != nullptr) {
+        xTaskNotifyGive(pitchBuilderTaskHandle);
+      }
+#endif
+    } else if (command == '.') {
+      screenshotFreezeRotation = true;
+      rotationQ16 +=
+          static_cast<uint32_t>(kScreenshotLongitudeStepTexels) << 16;
+    } else if (command == ',') {
+      screenshotFreezeRotation = true;
+      rotationQ16 -=
+          static_cast<uint32_t>(kScreenshotLongitudeStepTexels) << 16;
+#if GLOBE_ENABLE_XY_ROTATION
+    } else if (command == '[') {
+      setPitchQ8(static_cast<int32_t>(pitchQ8) -
+                 10 * 256);
+    } else if (command == ']') {
+      setPitchQ8(static_cast<int32_t>(pitchQ8) +
+                 10 * 256);
+#endif
     }
   }
 }
@@ -1620,25 +2775,21 @@ __attribute__((always_inline)) inline uint16_t sampleGlobeColor(
 #if GLOBE_USE_HALF_BACK_TEXTURE
   const uint16_t backU = backUFull >> 1;
   const uint8_t backPair = backTextureRow[backU >> 1];
-  const uint8_t backIntensity =
+  uint8_t backIntensity =
       (backU & 1U) ? (backPair & 0x0FU) : (backPair >> 4);
 #else
-  const uint8_t backPacked = backTextureRow[backUFull];
+  uint8_t backIntensity = backTextureRow[backUFull] & 0x0FU;
+#endif
+#if GLOBE_ENABLE_SCREENSHOT
+  if (!screenshotBackHemisphereEnabled) {
+    backIntensity = 0;
+  }
 #endif
 #if GLOBE_USE_DIRECT_COLOR_TABLE
   const uint16_t textureIndex =
       static_cast<uint16_t>(
-          (frontIntensity << 4) |
-#if GLOBE_USE_HALF_BACK_TEXTURE
-          backIntensity
+          (frontIntensity << 4) | backIntensity);
 #else
-          (backPacked & 0x0FU)
-#endif
-      );
-#else
-#if !GLOBE_USE_HALF_BACK_TEXTURE
-  const uint8_t backIntensity = backPacked & 0x0F;
-#endif
   const uint8_t backContribution =
       static_cast<uint8_t>((backIntensity * 3 + 2) >> 2);
   const uint8_t intensity =
@@ -1660,6 +2811,279 @@ __attribute__((always_inline)) inline uint16_t sampleGlobeColor(
   return globePalette[(coverage << 8) | (shade << 4) | intensity];
 #endif
 }
+
+#if GLOBE_ENABLE_XY_ROTATION
+__attribute__((always_inline)) inline uint8_t samplePitchFront(
+    uint16_t frontU, uint16_t frontV) {
+  const uint8_t *__restrict__ textureRow =
+      pitchFrontTexture + static_cast<uint32_t>(frontV) *
+#if GLOBE_USE_PACKED_FRONT_TEXTURE
+                         globe_texture::kRowByteCount;
+  const uint8_t frontPair = textureRow[frontU >> 1];
+  return static_cast<uint8_t>(
+      (frontPair >> (((frontU ^ 1U) & 1U) << 2)) & 0x0FU);
+#else
+                         globe_texture::kWidth;
+  return textureRow[frontU] >> 4;
+#endif
+}
+
+__attribute__((always_inline)) inline uint8_t samplePitchBack(
+    uint16_t backU, uint16_t backV, uint8_t backAlpha = 255) {
+#if GLOBE_ENABLE_BACK_HEMISPHERE
+  const uint8_t *__restrict__ backTextureRow =
+      pitchBackTextureHigh + static_cast<uint32_t>(backV) *
+                                 world_texture::kWidth;
+  uint8_t backIntensity = backTextureRow[backU] & 0x0FU;
+#if GLOBE_ENABLE_SCREENSHOT
+  if (!screenshotBackHemisphereEnabled) {
+    backIntensity = 0;
+  }
+#endif
+  if (backAlpha < 255U) {
+    backIntensity = static_cast<uint8_t>(
+        (static_cast<uint16_t>(backIntensity) * backAlpha + 127U) >>
+        8);
+  }
+  return backIntensity;
+#else
+  return 0;
+#endif
+}
+
+__attribute__((always_inline)) inline uint16_t composeTiltedGlobeColor(
+    uint16_t surfaceSample, uint8_t frontIntensity,
+    uint8_t backIntensity) {
+#if GLOBE_USE_DIRECT_COLOR_TABLE
+  const uint16_t textureIndex =
+      static_cast<uint16_t>((frontIntensity << 4) | backIntensity);
+  return globeColorTable[((surfaceSample >> 10) << 8) | textureIndex];
+#else
+  const uint8_t shade = (surfaceSample >> 10) & kShadeMask;
+  const uint8_t coverage = surfaceSample >> 14;
+  const uint8_t backContribution =
+      static_cast<uint8_t>((backIntensity * 3 + 2) >> 2);
+  const uint8_t intensity =
+      min<uint8_t>(15, frontIntensity + backContribution);
+  return globePalette[(coverage << 8) | (shade << 4) | intensity];
+#endif
+}
+
+#if GLOBE_ENABLE_SPAN_REFERENCE
+GLOBE_RENDER_MEM GLOBE_RENDER_OPT void renderPitchSpanLut(
+    uint16_t rotationTexels, const PitchSpanLut &lut) {
+  for (int16_t localY = 0; localY < kLutDiameter; ++localY) {
+    uint16_t *__restrict__ destination =
+        frameBuffer +
+        static_cast<uint32_t>(kLutOriginY + localY - kFrameScreenY) *
+            kFrameWidth +
+        (kLutOriginX - kFrameScreenX);
+    const uint32_t rowOffset =
+        static_cast<uint32_t>(localY) * kLutDiameter;
+    const uint16_t *__restrict__ surface = sphereLut + rowOffset;
+    const uint16_t left = sphereLeft[localY];
+    const uint16_t right = sphereRight[localY];
+    if (left > right) {
+      continue;
+    }
+
+    uint16_t *__restrict__ dst = destination + left;
+    surface += left;
+    const PitchSpanRow &row = lut.rows[localY];
+    memcpy(pitchRowScratch, lut.spans + row.firstSpan,
+           static_cast<size_t>(row.spanCount) * sizeof(PitchSpan));
+    for (uint8_t spanIndex = 0; spanIndex < row.spanCount;
+         ++spanIndex) {
+      const PitchSpan &span = pitchRowScratch[spanIndex];
+      int32_t frontUQ6 = span.frontUQ6;
+      int32_t frontVQ6 = span.frontVQ6;
+      int32_t backUQ6 = span.backUQ6;
+      int32_t backVQ6 = span.backVQ6;
+      uint16_t count = span.pixelCount;
+      while (count-- != 0) {
+        const uint16_t frontU =
+            static_cast<uint16_t>(frontUQ6 >>
+                                  kPitchCoordinateFractionBits) &
+            kPitchFrontUMask;
+        const uint16_t frontV = min<uint16_t>(
+            kPitchFrontVMask,
+            static_cast<uint16_t>(
+                frontVQ6 >> kPitchCoordinateFractionBits));
+        const uint16_t backU =
+            static_cast<uint16_t>(backUQ6 >>
+                                  kPitchCoordinateFractionBits) &
+            kPitchBackUMask;
+        const uint16_t backV = static_cast<uint16_t>(
+            min<int32_t>(world_texture::kHeight - 1,
+                         backVQ6 >> kPitchCoordinateFractionBits));
+        const uint8_t frontIntensity = samplePitchFront(
+            (frontU + rotationTexels) & kPitchFrontUMask, frontV);
+        const uint8_t backIntensity = samplePitchBack(
+            (backU + rotationTexels) & kPitchBackUMask, backV);
+        *dst++ = composeTiltedGlobeColor(
+            *surface++, frontIntensity, backIntensity);
+        frontUQ6 += span.frontUStepQ6;
+        frontVQ6 += span.frontVStepQ6;
+        backUQ6 += span.backUStepQ6;
+        backVQ6 += span.backVStepQ6;
+      }
+    }
+  }
+}
+#endif
+
+void renderGlobe(uint16_t rotationTexels);
+
+GLOBE_RENDER_MEM GLOBE_RENDER_OPT void renderPitchPreviewLut(
+    uint16_t rotationTexels, const uint8_t *__restrict__ map,
+    uint8_t backAlpha = 255) {
+  for (uint16_t localY = 0; localY < kLutDiameter; ++localY) {
+    const uint16_t left = sphereLeft[localY];
+    const uint16_t right = sphereRight[localY];
+    if (left > right) {
+      continue;
+    }
+    const uint32_t rowOffset =
+        static_cast<uint32_t>(localY) * kLutDiameter;
+    uint16_t *__restrict__ dst =
+        frameBuffer +
+        static_cast<uint32_t>(kLutOriginY + localY - kFrameScreenY) *
+            kFrameWidth +
+        (kLutOriginX - kFrameScreenX) + left;
+    const uint16_t *__restrict__ surface =
+        sphereLut + rowOffset + left;
+    const uint8_t *__restrict__ coordinate =
+        map + (rowOffset + left) * kPitchPreviewBytesPerPixel;
+    uint16_t count = right - left + 1;
+    while (count-- != 0) {
+      uint16_t baseFrontU;
+      uint16_t frontV;
+      readPreviewPitchCoordinate(coordinate, baseFrontU, frontV);
+      coordinate += kPitchPreviewBytesPerPixel;
+      const uint16_t frontU =
+          (baseFrontU + rotationTexels) & kPitchFrontUMask;
+      // Preview stores only the blended visible surface. Mirror its final
+      // longitude for the translucent rear layer, matching the zero-pitch
+      // renderer while retaining the full 1024x512 diffuse texture.
+      const uint16_t backU =
+          (globe_texture::kWidth / 2U - baseFrontU + rotationTexels) &
+          kPitchBackUMask;
+      const uint8_t frontIntensity =
+          samplePitchFront(frontU, frontV);
+      const uint8_t backIntensity =
+          samplePitchBack(backU, frontV, backAlpha);
+      *dst++ = composeTiltedGlobeColor(
+          *surface++, frontIntensity, backIntensity);
+    }
+  }
+}
+
+GLOBE_RENDER_MEM GLOBE_RENDER_OPT void renderPitchAnchorBlendPreview(
+    uint16_t rotationTexels, int16_t targetPitchQ8,
+    uint8_t backAlpha = 0) {
+  uint8_t lowerIndex;
+  uint8_t upperIndex;
+  uint8_t blendQ8;
+  selectPitchAnchors(targetPitchQ8, lowerIndex, upperIndex, blendQ8);
+
+  if (lowerIndex == upperIndex || blendQ8 == 0) {
+    if (lowerIndex == kZeroPitchAnchorIndex) {
+      renderGlobe(rotationTexels);
+      return;
+    }
+    renderPitchPreviewLut(rotationTexels, pitchAnchorMaps[lowerIndex],
+                          backAlpha);
+    return;
+  }
+
+  for (uint16_t localY = 0; localY < kLutDiameter; ++localY) {
+    const uint16_t left = sphereLeft[localY];
+    const uint16_t right = sphereRight[localY];
+    if (left > right) {
+      continue;
+    }
+    const uint32_t rowOffset =
+        static_cast<uint32_t>(localY) * kLutDiameter;
+    uint16_t *__restrict__ dst =
+        frameBuffer +
+        static_cast<uint32_t>(kLutOriginY + localY - kFrameScreenY) *
+            kFrameWidth +
+        (kLutOriginX - kFrameScreenX) + left;
+    const uint16_t *__restrict__ surface =
+        sphereLut + rowOffset + left;
+    for (uint16_t localX = left; localX <= right; ++localX) {
+      const uint32_t lutIndex = rowOffset + localX;
+      uint16_t lowerU;
+      uint16_t lowerV;
+      uint16_t upperU;
+      uint16_t upperV;
+      readPitchAnchorCoordinate(lowerIndex, lutIndex, localY, lowerU,
+                                lowerV);
+      readPitchAnchorCoordinate(upperIndex, lutIndex, localY, upperU,
+                                upperV);
+      const int32_t wrappedDeltaU =
+          ((upperU - lowerU + globe_texture::kWidth / 2) &
+           (globe_texture::kWidth - 1)) -
+          globe_texture::kWidth / 2;
+      const uint16_t baseFrontU = static_cast<uint16_t>(
+          lowerU + ((wrappedDeltaU * blendQ8 + 128) >> 8)) &
+          kPitchFrontUMask;
+      const uint16_t frontV = static_cast<uint16_t>(
+          lowerV +
+          (((static_cast<int32_t>(upperV) - lowerV) * blendQ8 + 128) >>
+           8));
+      const uint16_t frontU =
+          (baseFrontU + rotationTexels) & kPitchFrontUMask;
+      const uint16_t backU =
+          (globe_texture::kWidth / 2U - baseFrontU + rotationTexels) &
+          kPitchBackUMask;
+      const uint8_t frontIntensity =
+          samplePitchFront(frontU, frontV);
+      const uint8_t backIntensity =
+          samplePitchBack(backU, frontV, backAlpha);
+      *dst++ = composeTiltedGlobeColor(
+          *surface++, frontIntensity, backIntensity);
+    }
+  }
+}
+
+GLOBE_RENDER_MEM GLOBE_RENDER_OPT void renderPitchExactLut(
+    uint16_t rotationTexels, const uint8_t *__restrict__ map,
+    uint8_t backAlpha = 255) {
+  for (uint16_t localY = 0; localY < kLutDiameter; ++localY) {
+    const uint16_t left = sphereLeft[localY];
+    const uint16_t right = sphereRight[localY];
+    if (left > right) {
+      continue;
+    }
+    const uint32_t rowOffset =
+        static_cast<uint32_t>(localY) * kLutDiameter;
+    uint16_t *__restrict__ dst =
+        frameBuffer +
+        static_cast<uint32_t>(kLutOriginY + localY - kFrameScreenY) *
+            kFrameWidth +
+        (kLutOriginX - kFrameScreenX) + left;
+    const uint16_t *__restrict__ surface =
+        sphereLut + rowOffset + left;
+    const uint8_t *__restrict__ coordinate =
+        map + (rowOffset + left) * kPitchExactBytesPerPixel;
+    uint16_t count = right - left + 1;
+    while (count-- != 0) {
+      const DensePitchCoordinates decoded =
+          readExactPitchCoordinate(coordinate);
+      coordinate += kPitchExactBytesPerPixel;
+      const uint8_t frontIntensity = samplePitchFront(
+          (decoded.frontU + rotationTexels) & kPitchFrontUMask,
+          decoded.frontV);
+      const uint8_t backIntensity = samplePitchBack(
+          (decoded.backU + rotationTexels) & kPitchBackUMask,
+          decoded.backV, backAlpha);
+      *dst++ = composeTiltedGlobeColor(
+          *surface++, frontIntensity, backIntensity);
+    }
+  }
+}
+#endif
 
 GLOBE_RENDER_MEM GLOBE_RENDER_OPT void renderGlobe(uint16_t rotationTexels) {
   // backU = 1.5 turns - baseU + rotation. Reusing frontU avoids rebuilding
@@ -1789,7 +3213,59 @@ void renderFrame(uint16_t rotationTexels) {
 #if GLOBE_ENABLE_SCREENSHOT
   const uint32_t globeStartUs = micros();
 #endif
+#if GLOBE_ENABLE_XY_ROTATION
+  const int16_t targetPitchQ8 = pitchQ8;
+  if (targetPitchQ8 == 0) {
+    renderGlobe(rotationTexels);
+    lastRenderedPitchMode = PitchDenseMode::Zero;
+  } else {
+    const PitchDenseMode mode = activePitchMode;
+    const int8_t previewIndex = activePreviewMapIndex;
+    const int16_t preparedPitchQ8 = renderedPitchQ8;
+    const bool preparedPreviewCurrent =
+        mode == PitchDenseMode::Preview && previewIndex >= 0 &&
+        preparedPitchQ8 == targetPitchQ8;
+    const bool preparedExactCurrent =
+        mode == PitchDenseMode::Exact && preparedPitchQ8 == targetPitchQ8;
+#if GLOBE_ENABLE_SCREENSHOT
+    const bool forceAnchorBlend = screenshotForcePitchAnchorBlend;
+    const bool forceSynthesizedPreview =
+        screenshotForcePitchPreview && !screenshotForcePitchAnchorBlend;
+#else
+    constexpr bool forceAnchorBlend = false;
+    constexpr bool forceSynthesizedPreview = false;
+#endif
+
+    if (forceAnchorBlend ||
+        (!preparedExactCurrent && !forceSynthesizedPreview)) {
+      // Transient pitch uses the direct anchor blend. Hide the rear layer here
+      // so release does not show several different back-hemisphere mappings.
+      renderPitchAnchorBlendPreview(rotationTexels, targetPitchQ8, 0);
+      lastRenderedPitchMode = PitchDenseMode::AnchorBlend;
+    } else if (forceSynthesizedPreview && preparedPreviewCurrent) {
+      renderPitchPreviewLut(rotationTexels,
+                            pitchPreviewMaps[previewIndex], 255);
+      lastRenderedPitchMode = PitchDenseMode::Preview;
+    } else if (preparedExactCurrent) {
+      uint8_t backAlpha = 255;
+      const uint32_t exactActivatedMs = pitchExactActivatedMs;
+      if (exactActivatedMs != 0) {
+        const uint32_t elapsedMs = millis() - exactActivatedMs;
+        if (elapsedMs < kPitchBackFadeMs) {
+          backAlpha = static_cast<uint8_t>(
+              (elapsedMs * 255U) / kPitchBackFadeMs);
+        }
+      }
+      renderPitchExactLut(rotationTexels, pitchExactMap, backAlpha);
+      lastRenderedPitchMode = PitchDenseMode::Exact;
+    } else {
+      renderPitchAnchorBlendPreview(rotationTexels, targetPitchQ8, 0);
+      lastRenderedPitchMode = PitchDenseMode::AnchorBlend;
+    }
+  }
+#else
   renderGlobe(rotationTexels);
+#endif
 #if GLOBE_ENABLE_SCREENSHOT
   profileGlobeMicros += micros() - globeStartUs;
 #endif
@@ -1900,6 +3376,42 @@ void setup() {
   sphereLut = static_cast<uint16_t *>(heap_caps_malloc(
       static_cast<size_t>(kLutDiameter) * kLutDiameter * sizeof(uint16_t),
       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#if GLOBE_ENABLE_XY_ROTATION
+  sphereNzQ15 = static_cast<uint16_t *>(heap_caps_malloc(
+      static_cast<size_t>(kLutDiameter) * kLutDiameter *
+          sizeof(uint16_t),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  const size_t pitchPixelCount =
+      static_cast<size_t>(kLutDiameter) * kLutDiameter;
+  const size_t pitchPreviewMapByteCount =
+      pitchPixelCount * kPitchPreviewBytesPerPixel;
+  const size_t pitchExactMapByteCount =
+      pitchPixelCount * kPitchExactBytesPerPixel;
+  bool pitchAllocationFailed = false;
+  for (uint8_t index = 0; index < kPitchAnchorCount; ++index) {
+    if (index == kZeroPitchAnchorIndex) {
+      continue;
+    }
+    pitchAnchorMaps[index] = static_cast<uint8_t *>(heap_caps_malloc(
+        pitchPreviewMapByteCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    pitchAllocationFailed |= pitchAnchorMaps[index] == nullptr;
+  }
+  for (uint8_t index = 0; index < 2; ++index) {
+    pitchPreviewMaps[index] = static_cast<uint8_t *>(heap_caps_malloc(
+        pitchPreviewMapByteCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    pitchAllocationFailed |= pitchPreviewMaps[index] == nullptr;
+  }
+  pitchExactMap = static_cast<uint8_t *>(heap_caps_malloc(
+      pitchExactMapByteCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  pitchFrontTexture = static_cast<uint8_t *>(heap_caps_malloc(
+      globe_texture::kByteCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  pitchBackTextureHigh = static_cast<uint8_t *>(heap_caps_malloc(
+      world_texture::kByteCount,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  pitchAllocationFailed |=
+      sphereNzQ15 == nullptr || pitchExactMap == nullptr ||
+      pitchFrontTexture == nullptr || pitchBackTextureHigh == nullptr;
+#endif
   overlayPixels = static_cast<uint32_t *>(heap_caps_malloc(
       static_cast<size_t>(kOverlayPixelCapacity) * sizeof(uint32_t),
       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
@@ -1907,17 +3419,31 @@ void setup() {
 
   if (frameBuffers[0] == nullptr || frameBuffers[1] == nullptr ||
       sphereLut == nullptr || overlayPixels == nullptr ||
-      overlayMutex == nullptr) {
+      overlayMutex == nullptr
+#if GLOBE_ENABLE_XY_ROTATION
+      || pitchAllocationFailed
+#endif
+  ) {
     haltWithMessage("PSRAM ALLOCATION FAILED");
   }
   initializeBackground(frameBuffers[0], kFrameWidth, kFrameHeight,
                        kFrameScreenX, kFrameScreenY);
   initializeBackground(frameBuffers[1], kFrameWidth, kFrameHeight,
                        kFrameScreenX, kFrameScreenY);
+#if GLOBE_ENABLE_XY_ROTATION
+  memcpy(pitchFrontTexture, globe_texture::kIntensity,
+         globe_texture::kByteCount);
+  memcpy(pitchBackTextureHigh, world_texture::kIntensity,
+         world_texture::kByteCount);
+#endif
 
   buildColorPalettes();
   buildClockTrigLut();
   buildSphereLut();
+#if GLOBE_ENABLE_XY_ROTATION
+  buildProjectionTrigLuts();
+  buildPitchAnchorBank();
+#endif
   refreshClockOverlay(true);
   if (overlayOverflow) {
     haltWithMessage("OVERLAY PIXEL CAPACITY");
@@ -1934,6 +3460,12 @@ void setup() {
                               nullptr, 0) != pdPASS) {
     haltWithMessage("DISPLAY TASK FAILED");
   }
+#if GLOBE_ENABLE_XY_ROTATION
+  if (xTaskCreatePinnedToCore(pitchBuilderTask, "globe-pitch", 16384, nullptr,
+                              1, &pitchBuilderTaskHandle, 0) != pdPASS) {
+    haltWithMessage("PITCH TASK FAILED");
+  }
+#endif
   if (xTaskCreatePinnedToCore(networkTimeTask, "globe-ntp", 6144, nullptr, 1,
                               nullptr, 0) != pdPASS) {
 #if GLOBE_ENABLE_SERIAL_STATS
@@ -1949,6 +3481,19 @@ void setup() {
                 kFrameWidth * kFrameHeight * sizeof(uint16_t));
   Serial.printf("Sphere LUT:   %u bytes\n",
                 kLutDiameter * kLutDiameter * sizeof(uint16_t));
+#if GLOBE_ENABLE_XY_ROTATION
+  Serial.printf("Sphere Z LUT: %u bytes\n",
+                kLutDiameter * kLutDiameter * sizeof(uint16_t));
+  Serial.printf("Pitch anchors:%u bytes (6 front-only maps)\n",
+                pitchPreviewMapByteCount * (kPitchAnchorCount - 1));
+  Serial.printf("Pitch preview:%u bytes (2 dense maps)\n",
+                pitchPreviewMapByteCount * 2);
+  Serial.printf("Pitch exact:  %u bytes (front + back dense map)\n",
+                pitchExactMapByteCount);
+  Serial.printf("Pitch texture:%u bytes (PSRAM front + high-res back)\n",
+                globe_texture::kByteCount +
+                    world_texture::kByteCount);
+#endif
   Serial.printf("World texture:%u bytes\n", globe_texture::kByteCount);
   Serial.printf("Overlay pixels:%u (%u bytes)\n", overlayPixelCount,
                 overlayPixelCount * sizeof(uint32_t));
@@ -1972,6 +3517,9 @@ void loop() {
   updateTouchInteraction(now, elapsedMs);
 #else
   rotationQ16 += elapsedMs * kAutoRotationVelocityQ16PerMs;
+#endif
+#if GLOBE_ENABLE_XY_ROTATION
+  activateReadyPitchLut();
 #endif
   if (clockOverlayDirty || now - lastClockUpdateMs >= 1000) {
     lastClockUpdateMs = now;

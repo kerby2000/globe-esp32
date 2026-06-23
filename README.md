@@ -14,18 +14,20 @@ The FT3168 touch controller is enabled in all build profiles:
 - Touch and hold pauses automatic rotation.
 - Drag horizontally to rotate the globe in the same direction as the finger.
   A full-width drag is one complete revolution.
+- Drag vertically to tilt the globe between 80° south and 80° north. Adjacent
+  projection maps are interpolated, so finger movement remains continuous.
 - Release after a drag to continue with inertia; the speed then settles back
-  to automatic rotation.
-- Double-tap resets the globe to its startup longitude.
+  to automatic rotation. Vertical pitch remains where it was released.
+- Double-tap resets both longitude and pitch to the startup view.
 - A stationary 700 ms long press cycles through digital, analog, hybrid, and
   globe-only display modes.
 
-This first interaction pass intentionally leaves the sphere latitude fixed.
 Touch uses the board's shared 300 kHz I2C bus on GPIO47/48 and adds no
 floating-point work to the frame loop. Startup allows 250 ms for the FT3168 to
 finish powering up instead of relying on a single early probe. If detection
 still fails, rendering continues with automatic rotation while touch recovery
-is retried once per second.
+is retried once per second. Touch and RTC transactions share a mutex because
+the NTP task can update the PCF85063 while the main core polls the FT3168.
 
 ## Real time and RTC
 
@@ -85,7 +87,12 @@ screenshots enabled but periodic serial stats disabled. Sending `P` returns a
 compact uptime/frame-count record for stability testing without autonomous USB
 output. Sending `Q` additionally returns cumulative render, transfer-task, and
 QSPI-only timings. For visual testing, `M` cycles the clock mode and `1` through
-`4` select digital, analog, hybrid, and globe-only modes directly.
+`4` select digital, analog, hybrid, and globe-only modes directly. `[` and `]`
+adjust pitch by 10° for screenshot comparisons. `0` resets and freezes the
+view, `.` and `,` step longitude by 16 texture texels, and `F` resumes or
+freezes automatic rotation. `A` forces the direct anchor-blend projection, `V`
+forces the synthesized preview projection, and `X` allows the exact refinement,
+which lets the three render paths be benchmarked independently.
 
 ## Rendering design
 
@@ -103,11 +110,23 @@ QSPI-only timings. For visual testing, `M` cycles the clock mode and `1` through
 - At startup, `buildSphereLut()` projects globe pixels to longitude and stores
   longitude, four-bit shading, and two-bit subpixel rim coverage in a compact
   16-bit PSRAM LUT. Latitude is shared by each scanline.
+- Zero pitch keeps the original row-coherent fast path. Nonzero pitch uses the
+  progressive dense-LUT system described below; longitude/yaw remains a cheap
+  runtime U offset.
+- The map generator applies periodic, latitude-aware horizontal prefiltering
+  above approximately 55° north/south. Equirectangular texels cover more
+  longitude as they approach a pole. The diffuse back layer additionally
+  converges toward each latitude row's periodic mean from 65° to 80°. This
+  removes the undefined directional component at the pole—the source of the
+  rotating radial pinwheel—without changing the sharp front geography or
+  adding runtime texture reads.
 - A 4×4 setup-time coverage estimate provides one-pixel silhouette
   antialiasing. The experimental wide soft-rim treatment was removed.
 - The original subtle exterior cyan halo is baked into both reusable
   framebuffers, adding no recurring render cost.
-- The expensive `sqrt`, `asin`, and `atan2` calls run only once during setup.
+- The frame loop contains no floating-point projection math. Background LUT
+  generation uses lookup-based `asin`/`atan2` approximations and a cached
+  per-pixel sphere-Z table.
 - Each frame uses integer texture samples and directly indexes a 32 KB
   precomputed RGB565 color table. The hot scanline loop is unrolled by eight,
   compiled with targeted `-O3`, and placed in internal executable RAM.
@@ -136,10 +155,61 @@ QSPI-only timings. For visual testing, `M` cycles the clock mode and `1` through
 Each packed framebuffer and the sphere LUT use about 358 KB. The front and back
 textures use 256 KB and 64 KB of flash. The direct globe color table uses 32 KB
 of internal RAM and the exact overlay component tables use 36 KB. The release
-build uses 8192-pixel QSPI chunks and an 80 MHz requested bus clock. The
-measured rate on the connected target board is a stable 30.23 FPS with touch,
-real-time clock updates, and the antialiased overlay, compared with 5 FPS for
-the initial single-buffer renderer.
+build uses 8192-pixel QSPI chunks and an 80 MHz requested bus clock.
+
+## Hybrid progressive pitch architecture
+
+Pitch cannot be produced correctly by linearly interpolating latitude/longitude
+coordinates from two precomputed views. Longitude wraps at the antimeridian and
+is undefined at a visible pole. Interpolating UV values across those
+singularities produced the vertical stitching line seen at intermediate pitches
+such as 60°, even though directly generated maps such as 80° were clean.
+
+The renderer now separates immediate interaction from final geometric
+correctness:
+
+1. Six front-only dense anchors are generated at startup for -80°, -55°, -25°,
+   +25°, +55°, and +80°. The existing zero-pitch sphere LUT is the seventh
+   implicit anchor and remains the default fast path.
+2. A pitch request coalesces any obsolete build and synthesizes an inactive
+   three-byte-per-pixel preview map from the two nearest anchors.
+3. Longitude uses shortest-path circular interpolation rather than raw U
+   interpolation. Around the visible pole, where longitude is undefined, a
+   small feathered region uses the accelerated exact projection to prevent the
+   former full-height center hairline from dominating the preview.
+4. If the requested pitch is not yet represented by the active exact map,
+   the frame renderer does not wait for the synthesized map. It directly blends
+   the two nearest anchor maps for the current `pitchQ8`, using circular U
+   interpolation, so vertical drag gives immediate pitch feedback and does not
+   snap back after release. The rear hemisphere is suppressed during this
+   transient path to avoid flicker from changing back-layer mappings.
+5. The synthesized preview map is still built in the background and selected at
+   a frame boundary only when explicitly requested by the screenshot/profiling
+   tools. Normal touch interaction skips this intermediate projection, so the
+   visible sequence is direct anchor-blend first, then exact correction.
+6. After 150 ms of pitch stability, a low-priority task on core 0 builds a
+   five-byte-per-pixel exact map with independent front and rear U/V. The
+   display transfer task has higher priority and can preempt this work. When
+   exact becomes active, the rear hemisphere fades in over 300 ms.
+7. Exact generation uses 4097-entry `asin` and first-quadrant `atan` tables plus
+   a cached Q15 sphere-Z map. No `asin`, `atan2`, or normal-case square root is
+   evaluated per generated pixel.
+8. While touch is active, exact publication waits. On release, a completed exact
+   map is atomically swapped at a frame boundary without changing yaw.
+9. Rapid pitch updates invalidate partial work by generation number, so only
+   the newest stable target can be published.
+
+The preview format stores front U10/V9 in three bytes. The exact format stores
+front and rear U10/V9 coordinates in five bytes. The hybrid PSRAM allocation is
+approximately 3.22 MB for six anchors, 1.07 MB for two preview maps, 0.89 MB for
+the exact map, 0.36 MB for cached sphere Z, and 0.79 MB for the packed front and
+full-resolution back texture copies.
+
+Anchor interpolation is still an approximation near a visible pole. The
+feathered exact patch confines the temporary error to that polar area; the
+progressive exact swap removes it completely. The former span builder remains
+in `src/main.cpp` as a compile-time reference under
+`GLOBE_ENABLE_SPAN_REFERENCE=1`, but is disabled in normal builds.
 
 ## Performance profiling
 
@@ -147,11 +217,16 @@ Build and upload `waveshare_amoled_143_screenshot`, then run:
 
 ```powershell
 python tools/profile_performance.py --port COM21
+python tools/profile_performance.py --port COM21 --pitch 60 --phase anchor
+python tools/profile_performance.py --port COM21 --pitch 60 --phase preview
+python tools/profile_performance.py --port COM21 --pitch 60 --phase exact
 ```
 
 The script samples quiet on-demand counters and reports average FPS, globe
 render time, display-core overlay time, complete display-task time, and
-QSPI-only time. Measurements on this board:
+QSPI-only time. `--pitch` freezes the view after the serial connection has
+reset the board. `--phase anchor|preview|exact` forces the requested
+progressive stage. Measurements on the connected board:
 
 | Configuration | Render | Globe | Overlay | Transfer | FPS |
 |---|---:|---:|---:|---:|---:|
@@ -169,6 +244,25 @@ QSPI-only time. Measurements on this board:
 | Full analog clock mode | 32.64 ms | 32.64 ms | 2.37 ms | 23.13 ms | 29.76 |
 | Hybrid clock mode | 32.82 ms | 32.82 ms | 2.89 ms | 23.67 ms | 29.64 |
 | Globe-only mode | **32.12 ms** | **32.12 ms** | **0.01 ms** | **20.84 ms** | **30.82** |
+| XY rotation, zero-pitch fast path | **32.91 ms** | **32.91 ms** | **2.18 ms** | **23.12 ms** | **30.02** |
+| Legacy interpolated +60° dense maps | 176.82 ms | 176.82 ms | 1.89 ms | 25.14 ms | 5.64 |
+| Legacy exact +80° dense map | 141.50 ms | 141.50 ms | 2.03 ms | 27.90 ms | 7.04 |
+| Dynamic exact +60° span LUT, 12,241 spans | 75.27 ms | 75.27 ms | 1.79 ms | 22.97 ms | **13.22** |
+| Dynamic exact +80° span LUT, 12,886 spans | 87.93 ms | 87.92 ms | 1.92 ms | 22.89 ms | **11.32** |
+| Hybrid preview +30° | 58.79 ms | 58.78 ms | 1.93 ms | 23.55 ms | **16.89** |
+| Hybrid exact +30° | 73.25 ms | 73.24 ms | 2.05 ms | 23.44 ms | **13.56** |
+| Hybrid preview +60° | 95.75 ms | 95.75 ms | 2.00 ms | 23.76 ms | **10.39** |
+| Hybrid exact +60° | 113.26 ms | 113.26 ms | 1.82 ms | 23.38 ms | **8.79** |
+| Hybrid preview +80° | 110.27 ms | 110.27 ms | 2.10 ms | 24.07 ms | **9.02** |
+| Hybrid exact +80° | 122.62 ms | 122.61 ms | 2.03 ms | 23.43 ms | **8.09** |
+
+Measured projection build latency:
+
+| Pitch | Preview LUT | Exact LUT |
+|---:|---:|---:|
+| 30° | 476 ms | 1,015 ms |
+| 60° | 488–535 ms | 805–829 ms |
+| 80° anchor | 92 ms | 780 ms |
 
 The current visual pass keeps the v0.5 rim and sharp 1024×512 front geography.
 Only the back texture and its pale green-cyan color treatment differ.
@@ -183,9 +277,10 @@ reduces the intentionally blurred back layer, leaving the detailed front map
 unchanged.
 
 Rendering and display work run concurrently on separate cores. The reported
-23.18 ms display-task time includes the 2.29 ms overlay phase and the 20.89 ms
-QSPI phase. Final FPS remains limited by the 32.75 ms globe render stage plus
-the small touch-polling cost rather than by display transfer.
+display-task time includes overlay composition and QSPI transfer. Zero pitch
+remains render-bound at roughly 33 ms. Tilted dense rendering is limited by
+non-row-coherent PSRAM texture access; the progressive design prioritizes
+sub-second interaction and exact seam-free correction over final tilted FPS.
 
 ## Capturing the framebuffer
 
@@ -203,6 +298,25 @@ This validates the renderer and framebuffer contents independently of the
 physical AMOLED. It cannot detect panel power, wiring, or viewing problems.
 With `GLOBE_TRANSFER_TIGHT=1`, the returned framebuffer is the packed 423×423
 moving region rather than the static 466×466 panel background.
+
+## Capturing a rotation movie
+
+The screenshot build also supports deterministic movie capture. The tool
+freezes automatic rotation, selects either the preview or exact projection,
+steps longitude between frames, validates every framebuffer CRC, and encodes
+the PNG sequence with FFmpeg:
+
+```powershell
+python tools/capture_movie.py --port COM21 --pitch 80 --phase exact `
+  --frames 16 --step-texels 64 --fps 8 `
+  --output polar-80.mp4 --keep-frames polar-80-frames
+```
+
+Sixteen frames stepped by 64 texels, or 64 frames stepped by 16 texels, cover
+one full 1024-texel revolution. Capture is slower than real time because every
+423×423 RGB565 framebuffer is transferred over USB, but playback timing is
+independent of capture speed. This records the actual ESP32 renderer and is
+therefore more useful for LUT/texture bugs than a separate web approximation.
 
 ## Regenerating the map
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math
 import random
 import urllib.request
 from pathlib import Path
@@ -165,6 +166,105 @@ def build_fog(width: int, height: int, physical: Image.Image) -> Image.Image:
     return scaled(fog.filter(ImageFilter.GaussianBlur(2.5)), 120, 255)
 
 
+def polar_prefilter(
+    image: Image.Image,
+    globe_radius: int = 211,
+    start_latitude: float = 55.0,
+    full_latitude: float = 75.0,
+    radius_scale: float = 1.0,
+) -> Image.Image:
+    """Antialias longitude where equirectangular texels converge at the poles.
+
+    On a sphere, one screen pixel covers increasingly many longitude texels as
+    cos(latitude) approaches zero. Sampling one longitude produces rotating
+    radial spokes around a visible pole. This periodic row filter approximates
+    that footprint offline, so runtime sampling remains one texel per surface.
+    """
+    width, height = image.size
+    source = image.load()
+    result = image.copy()
+    target = result.load()
+    equatorial_texels_per_pixel = width / (2.0 * math.pi * globe_radius)
+
+    for y in range(height):
+        latitude = 90.0 - (y + 0.5) * 180.0 / height
+        absolute_latitude = abs(latitude)
+        if absolute_latitude <= start_latitude:
+            continue
+
+        cosine = max(1.0e-4, math.cos(math.radians(absolute_latitude)))
+        footprint = equatorial_texels_per_pixel / cosine
+        radius = min(
+            width // 2,
+            max(1, math.ceil(max(0.0, footprint - 1.0) * radius_scale)),
+        )
+        transition = min(
+            1.0,
+            (absolute_latitude - start_latitude)
+            / (full_latitude - start_latitude),
+        )
+        blend = transition * transition * (3.0 - 2.0 * transition)
+        row = [source[x, y] for x in range(width)]
+
+        if radius >= width // 2:
+            filtered = [sum(row) // width] * width
+        else:
+            extended = row[-radius:] + row + row[:radius]
+            prefix = [0]
+            for value in extended:
+                prefix.append(prefix[-1] + value)
+            window = radius * 2 + 1
+            filtered = [
+                (prefix[x + window] - prefix[x] + window // 2) // window
+                for x in range(width)
+            ]
+
+        inverse = 1.0 - blend
+        for x in range(width):
+            target[x, y] = round(row[x] * inverse + filtered[x] * blend)
+    return result
+
+
+def homogenize_back_poles(
+    image: Image.Image,
+    start_latitude: float = 65.0,
+    full_latitude: float = 80.0,
+) -> Image.Image:
+    """Make the diffuse back layer converge smoothly at each pole.
+
+    Longitude is undefined at exactly +/-90 degrees. Even a correctly filtered
+    equirectangular fog texture otherwise turns ordinary longitude variation
+    into a rotating radial pinwheel. Blending toward the periodic row mean is
+    equivalent to removing that undefined directional component. This is only
+    applied to the intentionally diffuse back hemisphere; front coastlines
+    retain their geographic detail.
+    """
+    width, height = image.size
+    source = image.load()
+    result = image.copy()
+    target = result.load()
+
+    for y in range(height):
+        latitude = 90.0 - (y + 0.5) * 180.0 / height
+        absolute_latitude = abs(latitude)
+        if absolute_latitude <= start_latitude:
+            continue
+
+        transition = min(
+            1.0,
+            (absolute_latitude - start_latitude)
+            / (full_latitude - start_latitude),
+        )
+        blend = transition * transition * (3.0 - 2.0 * transition)
+        row_mean = round(sum(source[x, y] for x in range(width)) / width)
+        inverse = 1.0 - blend
+        for x in range(width):
+            target[x, y] = round(
+                source[x, y] * inverse + row_mean * blend
+            )
+    return result
+
+
 def build_texture(
     land_data: dict,
     coastline_data: dict,
@@ -281,6 +381,12 @@ def build_texture(
         back = ImageChops.lighter(
             back, build_fog(width, height, physical_target)
         )
+    # Latitude-aware periodic filtering removes radial longitude spokes when
+    # XY rotation brings either pole into view. The already-soft back layer
+    # receives a slightly wider footprint than the detailed front geography.
+    front = polar_prefilter(front, radius_scale=1.0)
+    back = polar_prefilter(back, radius_scale=1.5)
+    back = homogenize_back_poles(back)
 
     front_values = front.load()
     back_values = back.load()
