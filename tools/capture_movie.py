@@ -135,7 +135,7 @@ def configure_capture(
     # '0' resets longitude/pitch and freezes auto-rotation. The clock mode is
     # independently selected so movies can isolate geography if desired.
     commands = bytearray(
-        b"A" if phase == "anchor"
+        b"A" if phase in ("anchor", "progressive")
         else (b"V" if phase == "preview" else b"X")
     )
     commands.extend(b"0")
@@ -143,6 +143,8 @@ def configure_capture(
         commands.extend(b"B")
     if globe_only:
         commands.extend(b"4")
+    else:
+        commands.extend(b"1")
     if pitch > 0:
         commands.extend(b"]" * (pitch // 10))
     elif pitch < 0:
@@ -153,6 +155,7 @@ def configure_capture(
     target_q8 = pitch * 256
     required_mode = 0 if pitch == 0 else {
         "anchor": 3,
+        "progressive": 3,
         "preview": 1,
         "exact": 2,
     }[phase]
@@ -207,9 +210,12 @@ def main() -> None:
     parser.add_argument("--pitch", type=int, default=80)
     parser.add_argument(
         "--phase",
-        choices=("anchor", "preview", "exact"),
+        choices=("anchor", "preview", "exact", "progressive"),
         default="exact",
-        help="capture direct anchor blend, synthesized preview, or exact LUT",
+        help=(
+            "capture direct anchor blend, synthesized preview, exact LUT, "
+            "or anchor-to-exact progressive refinement"
+        ),
     )
     parser.add_argument(
         "--frames",
@@ -231,6 +237,15 @@ def main() -> None:
         type=float,
         default=0.0,
         help="wait after the selected pitch renderer becomes active",
+    )
+    parser.add_argument(
+        "--refine-at-frame",
+        type=int,
+        default=16,
+        help=(
+            "in progressive mode, release the exact LUT before this "
+            "zero-based frame"
+        ),
     )
     parser.add_argument("--output", type=Path, default=Path("globe.mp4"))
     parser.add_argument(
@@ -256,6 +271,13 @@ def main() -> None:
         parser.error("--step-texels must be a positive multiple of 16")
     if args.fps <= 0:
         parser.error("--fps must be positive")
+    if args.phase == "progressive" and not (
+        1 <= args.refine_at_frame < args.frames
+    ):
+        parser.error(
+            "--refine-at-frame must be between 1 and frames-1 "
+            "in progressive mode"
+        )
 
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="globe-movie-") as temporary:
@@ -286,6 +308,17 @@ def main() -> None:
                 time.sleep(args.post_ready_settle)
 
             for index in range(args.frames):
+                if (
+                    args.phase == "progressive"
+                    and index == args.refine_at_frame
+                ):
+                    print(
+                        f"\nReleasing exact refinement at frame "
+                        f"{index + 1}/{args.frames}..."
+                    )
+                    port.write(b"X")
+                    port.flush()
+                    time.sleep(args.settle)
                 width, height, payload, crc = request_frame(
                     port, args.timeout
                 )
