@@ -93,6 +93,8 @@ view, `.` and `,` step longitude by 16 texture texels, and `F` resumes or
 freezes automatic rotation. `A` forces the direct anchor-blend projection, `V`
 forces the synthesized preview projection, and `X` allows the exact refinement,
 which lets the three render paths be benchmarked independently.
+`H` returns current PSRAM capacity/free/largest-block values plus the selected
+tilted texture layout.
 
 ## Rendering design
 
@@ -113,6 +115,12 @@ which lets the three render paths be benchmarked independently.
 - Zero pitch keeps the original row-coherent fast path. Nonzero pitch uses the
   progressive dense-LUT system described below; longitude/yaw remains a cheap
   runtime U offset.
+- The zero-pitch path continues to read the original row-major flash textures.
+  Preview and exact tilted paths use private PSRAM copies tiled as 16×4 packed
+  four-bit texels. Each 32-byte tile fits one ESP32-S3 cache line, so diagonal
+  and polar texture traversal no longer jumps between distant row-major cache
+  lines. The release back texture is the original full 1024×512 diffuse layer,
+  repacked from one source byte per texel to two texels per tiled byte.
 - The map generator applies periodic, latitude-aware horizontal prefiltering
   above approximately 55° north/south. Equirectangular texels cover more
   longitude as they approach a pole. The diffuse back layer additionally
@@ -202,8 +210,8 @@ correctness:
 The preview format stores front U10/V9 in three bytes. The exact format stores
 front and rear U10/V9 coordinates in five bytes. The hybrid PSRAM allocation is
 approximately 3.22 MB for six anchors, 1.07 MB for two preview maps, 0.89 MB for
-the exact map, 0.36 MB for cached sphere Z, and 0.79 MB for the packed front and
-full-resolution back texture copies.
+the exact map, 0.36 MB for cached sphere Z, and 0.50 MB for the packed tiled
+front and full-resolution back texture copies.
 
 Anchor interpolation is still an approximation near a visible pole. The
 feathered exact patch confines the temporary error to that polar area; the
@@ -255,6 +263,39 @@ progressive stage. Measurements on the connected board:
 | Hybrid exact +60° | 113.26 ms | 113.26 ms | 1.82 ms | 23.38 ms | **8.79** |
 | Hybrid preview +80° | 110.27 ms | 110.27 ms | 2.10 ms | 24.07 ms | **9.02** |
 | Hybrid exact +80° | 122.62 ms | 122.61 ms | 2.03 ms | 23.43 ms | **8.09** |
+
+### Tilted texture locality benchmark
+
+Measured on June 23, 2026 with the same firmware and exact pitch maps. Values
+are globe render milliseconds / FPS. “Row full” is the previous implementation.
+
+| Tilted texture layout | Preview 30° | Preview 60° | Preview 80° | Texture PSRAM | Free PSRAM |
+|---|---:|---:|---:|---:|---:|
+| Row front + row full back | 61.84 / 16.04 | 98.45 / 10.09 | 111.38 / 8.93 | 768 KB | 0.86 MB |
+| Tiled front + row full back | 58.41 / 16.97 | 80.43 / 12.36 | 94.69 / 10.50 | 768 KB | 0.86 MB |
+| Tiled front + tiled full back | **55.35 / 17.90** | 67.18 / 14.78 | 73.40 / 13.53 | 512 KB | 1.12 MB |
+| Tiled front + tiled 512×256 back | 57.28 / 17.31 | **63.90 / 15.52** | **69.54 / 14.25** | 320 KB | 1.31 MB |
+| Tiled front only | 40.76 / 24.25 | 46.55 / 21.26 | 51.69 / 19.18 | 256 KB | 1.37 MB |
+
+| Tilted texture layout | Exact 30° | Exact 60° | Exact 80° | Texture PSRAM | Free PSRAM |
+|---|---:|---:|---:|---:|---:|
+| Row front + row full back | 74.51 / 13.33 | 114.33 / 8.70 | 123.50 / 8.06 | 768 KB | 0.86 MB |
+| Tiled front + row full back | 68.75 / 14.40 | 92.30 / 10.77 | 105.99 / 9.39 | 768 KB | 0.86 MB |
+| Tiled front + tiled full back | **66.19 / 14.99** | 76.92 / 12.90 | 92.68 / 10.73 | 512 KB | 1.12 MB |
+| Tiled front + tiled 512×256 back | 66.11 / 15.02 | **73.20 / 13.56** | **80.01 / 12.41** | 320 KB | 1.31 MB |
+| Tiled front only | 45.00 / 22.00 | 50.78 / 19.52 | 55.95 / 17.73 | 256 KB | 1.37 MB |
+
+The release selects tiled front + tiled full back. At exact 60° this reduces
+rendering from 114.33 ms to 76.92 ms (32.7%) and increases FPS from 8.70 to
+12.90 without changing pixels. Deterministic settled 60° captures from the row
+baseline, tiled-front/row-back, and fully tiled full-back builds all produced
+CRC32 `41ae23d8`.
+
+The tiled 512×256 back is faster, particularly near 80°, but it changes the
+diffuse rear geography: 22.24% of framebuffer pixels differed in the 60° test,
+with a mean absolute channel difference of 1.95/255. It remains available as
+`GLOBE_TILTED_BACK_MODE=2`. Front-only mode isolates the cost of the rear layer
+but intentionally removes the glass-like rear geography.
 
 Measured projection build latency:
 
@@ -311,6 +352,9 @@ python tools/capture_movie.py --port COM21 --pitch 80 --phase exact `
   --frames 16 --step-texels 64 --fps 8 `
   --output polar-80.mp4 --keep-frames polar-80-frames
 ```
+
+Use `--post-ready-settle 0.6` when comparing final exact frames so the 300 ms
+rear-layer fade has completed before the first screenshot.
 
 Sixteen frames stepped by 64 texels, or 64 frames stepped by 16 texels, cover
 one full 1024-texel revolution. Capture is slower than real time because every

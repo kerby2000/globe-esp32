@@ -31,6 +31,21 @@
 #define GLOBE_USE_PACKED_FRONT_TEXTURE 0
 #endif
 
+// Tilted renderers can keep their private PSRAM texture copies in cache-line
+// sized tiles. The zero-pitch renderer always continues to read the original
+// row-major flash textures selected above.
+#ifndef GLOBE_TILTED_FRONT_TILED
+#define GLOBE_TILTED_FRONT_TILED 0
+#endif
+
+// 0: row-major full-resolution back (legacy 8-bit source bytes)
+// 1: tiled full-resolution back, packed 4-bit
+// 2: tiled 512x256 blurred back, packed 4-bit
+// 3: no back hemisphere in tilted renderers
+#ifndef GLOBE_TILTED_BACK_MODE
+#define GLOBE_TILTED_BACK_MODE 0
+#endif
+
 #if GLOBE_USE_PACKED_FRONT_TEXTURE
 #include "world_front_1024.h"
 #include "world_texture.h"
@@ -46,6 +61,13 @@ namespace globe_texture = world_texture;
 #if GLOBE_USE_HALF_BACK_TEXTURE
 #include "world_back_512.h"
 #endif
+
+static_assert(GLOBE_TILTED_BACK_MODE >= 0 &&
+              GLOBE_TILTED_BACK_MODE <= 3);
+static_assert(!GLOBE_TILTED_FRONT_TILED ||
+              GLOBE_USE_PACKED_FRONT_TEXTURE);
+static_assert(GLOBE_TILTED_BACK_MODE != 2 ||
+              GLOBE_USE_HALF_BACK_TEXTURE);
 
 #ifndef GLOBE_ENABLE_SERIAL_STATS
 #define GLOBE_ENABLE_SERIAL_STATS 0
@@ -227,6 +249,28 @@ constexpr uint8_t kPitchExactBytesPerPixel = 5;
 constexpr uint16_t kPitchExactStabilityMs = 150;
 constexpr uint16_t kPitchBackFadeMs = 300;
 constexpr uint16_t kProjectionTrigLutSize = 4097;
+constexpr uint8_t kPitchTextureTileWidth = 16;
+constexpr uint8_t kPitchTextureTileHeight = 4;
+constexpr uint8_t kPitchTextureTileBytes =
+    kPitchTextureTileWidth * kPitchTextureTileHeight / 2;
+constexpr size_t kPitchFrontTextureByteCount =
+    static_cast<size_t>(globe_texture::kWidth) *
+    globe_texture::kHeight / 2;
+#if GLOBE_TILTED_BACK_MODE == 0
+constexpr size_t kPitchBackTextureByteCount =
+    world_texture::kByteCount;
+#elif GLOBE_TILTED_BACK_MODE == 1
+constexpr size_t kPitchBackTextureByteCount =
+    static_cast<size_t>(world_texture::kWidth) *
+    world_texture::kHeight / 2;
+#elif GLOBE_TILTED_BACK_MODE == 2
+constexpr size_t kPitchBackTextureByteCount =
+    world_back_texture::kByteCount;
+#else
+constexpr size_t kPitchBackTextureByteCount = 0;
+#endif
+constexpr size_t kPitchTextureByteCount =
+    kPitchFrontTextureByteCount + kPitchBackTextureByteCount;
 
 enum class PitchDenseMode : uint8_t {
   Zero = 0,
@@ -275,6 +319,15 @@ static_assert(sizeof(PitchSpanRow) == 4);
 #endif
 static_assert(kPitchAnchorCount == 7);
 static_assert(kPitchAnchorDegrees[kZeroPitchAnchorIndex] == 0);
+static_assert(globe_texture::kWidth == 1024);
+static_assert(globe_texture::kHeight == 512);
+static_assert(kPitchTextureTileBytes == 32);
+static_assert(globe_texture::kWidth % kPitchTextureTileWidth == 0);
+static_assert(globe_texture::kHeight % kPitchTextureTileHeight == 0);
+#if GLOBE_TILTED_BACK_MODE == 2
+static_assert(world_back_texture::kWidth % kPitchTextureTileWidth == 0);
+static_assert(world_back_texture::kHeight % kPitchTextureTileHeight == 0);
+#endif
 #endif
 
 // One full rotation per 18 seconds, represented as Q16.16 texels/ms.
@@ -1600,6 +1653,79 @@ readExactPitchCoordinate(const uint8_t *__restrict__ source) {
   return coordinate;
 }
 
+void tilePacked4Texture(uint8_t *__restrict__ destination,
+                        const uint8_t *__restrict__ source,
+                        uint16_t width, uint16_t height) {
+  const uint16_t sourceRowBytes = width / 2;
+  uint8_t *output = destination;
+  for (uint16_t tileY = 0;
+       tileY < height / kPitchTextureTileHeight; ++tileY) {
+    for (uint16_t tileX = 0;
+         tileX < width / kPitchTextureTileWidth; ++tileX) {
+      for (uint8_t localY = 0; localY < kPitchTextureTileHeight;
+           ++localY) {
+        const uint8_t *sourceBytes =
+            source +
+            static_cast<uint32_t>(
+                tileY * kPitchTextureTileHeight + localY) *
+                sourceRowBytes +
+            tileX * (kPitchTextureTileWidth / 2);
+        memcpy(output, sourceBytes, kPitchTextureTileWidth / 2);
+        output += kPitchTextureTileWidth / 2;
+      }
+    }
+  }
+}
+
+void tileFullBackTexture(uint8_t *__restrict__ destination) {
+  uint8_t *output = destination;
+  for (uint16_t tileY = 0;
+       tileY < world_texture::kHeight / kPitchTextureTileHeight;
+       ++tileY) {
+    for (uint16_t tileX = 0;
+         tileX < world_texture::kWidth / kPitchTextureTileWidth;
+         ++tileX) {
+      for (uint8_t localY = 0; localY < kPitchTextureTileHeight;
+           ++localY) {
+        const uint8_t *source =
+            world_texture::kIntensity +
+            static_cast<uint32_t>(
+                tileY * kPitchTextureTileHeight + localY) *
+                world_texture::kWidth +
+            tileX * kPitchTextureTileWidth;
+        for (uint8_t localX = 0; localX < kPitchTextureTileWidth;
+             localX += 2) {
+          *output++ = static_cast<uint8_t>(
+              ((source[localX] & 0x0FU) << 4) |
+              (source[localX + 1] & 0x0FU));
+        }
+      }
+    }
+  }
+}
+
+void preparePitchTextures() {
+#if GLOBE_TILTED_FRONT_TILED
+  tilePacked4Texture(pitchFrontTexture, globe_texture::kIntensity,
+                     globe_texture::kWidth, globe_texture::kHeight);
+#else
+  memcpy(pitchFrontTexture, globe_texture::kIntensity,
+         kPitchFrontTextureByteCount);
+#endif
+
+#if GLOBE_TILTED_BACK_MODE == 0
+  memcpy(pitchBackTextureHigh, world_texture::kIntensity,
+         kPitchBackTextureByteCount);
+#elif GLOBE_TILTED_BACK_MODE == 1
+  tileFullBackTexture(pitchBackTextureHigh);
+#elif GLOBE_TILTED_BACK_MODE == 2
+  tilePacked4Texture(pitchBackTextureHigh,
+                     world_back_texture::kIntensity,
+                     world_back_texture::kWidth,
+                     world_back_texture::kHeight);
+#endif
+}
+
 void buildProjectionTrigLuts() {
   constexpr float kPi = 3.14159265358979323846f;
   for (uint16_t index = 0; index < kProjectionTrigLutSize; ++index) {
@@ -2607,6 +2733,27 @@ void sendPitchStatus() {
   Serial.flush();
 }
 
+void sendMemoryStatus() {
+  // "GLBM", total/free/largest PSRAM, tilted texture bytes, and layout flags.
+  Serial.write(reinterpret_cast<const uint8_t *>("GLBM"), 4);
+  writeLittleEndian32(ESP.getPsramSize());
+  writeLittleEndian32(ESP.getFreePsram());
+  writeLittleEndian32(
+      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+#if GLOBE_ENABLE_XY_ROTATION
+  writeLittleEndian32(kPitchTextureByteCount);
+  Serial.write(static_cast<uint8_t>(GLOBE_TILTED_FRONT_TILED));
+  Serial.write(static_cast<uint8_t>(GLOBE_TILTED_BACK_MODE));
+#else
+  writeLittleEndian32(0);
+  Serial.write(static_cast<uint8_t>(0));
+  Serial.write(static_cast<uint8_t>(0));
+#endif
+  Serial.write(static_cast<uint8_t>(GLOBE_USE_HALF_BACK_TEXTURE));
+  Serial.write(static_cast<uint8_t>(0));
+  Serial.flush();
+}
+
 void serviceSerialCommands() {
   while (Serial.available() > 0) {
     const int command = Serial.read();
@@ -2618,6 +2765,8 @@ void serviceSerialCommands() {
       sendDetailedPerformanceSnapshot();
     } else if (command == 'T' || command == 't') {
       sendPitchStatus();
+    } else if (command == 'H' || command == 'h') {
+      sendMemoryStatus();
 #if GLOBE_ENABLE_SERIAL_STATS
     } else if (command == 'I' || command == 'i') {
       Serial.printf(
@@ -2813,8 +2962,25 @@ __attribute__((always_inline)) inline uint16_t sampleGlobeColor(
 }
 
 #if GLOBE_ENABLE_XY_ROTATION
+__attribute__((always_inline)) inline uint8_t samplePitchFrontTiled(
+    uint16_t frontU, uint16_t frontV) {
+  // 16x4 packed tiles are exactly 32 bytes. All bits in this offset occupy
+  // disjoint ranges, so OR avoids a multiply in the tilted hot loop.
+  const uint32_t byteOffset =
+      (static_cast<uint32_t>(frontV >> 2) << 11) |
+      (static_cast<uint32_t>(frontU >> 4) << 5) |
+      (static_cast<uint32_t>(frontV & 3U) << 3) |
+      ((frontU & 15U) >> 1);
+  const uint8_t pair = pitchFrontTexture[byteOffset];
+  return static_cast<uint8_t>(
+      (frontU & 1U) ? (pair & 0x0FU) : (pair >> 4));
+}
+
 __attribute__((always_inline)) inline uint8_t samplePitchFront(
     uint16_t frontU, uint16_t frontV) {
+#if GLOBE_TILTED_FRONT_TILED
+  return samplePitchFrontTiled(frontU, frontV);
+#else
   const uint8_t *__restrict__ textureRow =
       pitchFrontTexture + static_cast<uint32_t>(frontV) *
 #if GLOBE_USE_PACKED_FRONT_TEXTURE
@@ -2826,15 +2992,47 @@ __attribute__((always_inline)) inline uint8_t samplePitchFront(
                          globe_texture::kWidth;
   return textureRow[frontU] >> 4;
 #endif
+#endif
+}
+
+__attribute__((always_inline)) inline uint8_t samplePitchBackTiled(
+    uint16_t backU, uint16_t backV) {
+#if GLOBE_TILTED_BACK_MODE == 1
+  const uint32_t byteOffset =
+      (static_cast<uint32_t>(backV >> 2) << 11) |
+      (static_cast<uint32_t>(backU >> 4) << 5) |
+      (static_cast<uint32_t>(backV & 3U) << 3) |
+      ((backU & 15U) >> 1);
+  const uint8_t pair = pitchBackTextureHigh[byteOffset];
+  return static_cast<uint8_t>(
+      (backU & 1U) ? (pair & 0x0FU) : (pair >> 4));
+#elif GLOBE_TILTED_BACK_MODE == 2
+  const uint16_t halfU = backU >> 1;
+  const uint16_t halfV = backV >> 1;
+  const uint32_t byteOffset =
+      (static_cast<uint32_t>(halfV >> 2) << 10) |
+      (static_cast<uint32_t>(halfU >> 4) << 5) |
+      (static_cast<uint32_t>(halfV & 3U) << 3) |
+      ((halfU & 15U) >> 1);
+  const uint8_t pair = pitchBackTextureHigh[byteOffset];
+  return static_cast<uint8_t>(
+      (halfU & 1U) ? (pair & 0x0FU) : (pair >> 4));
+#else
+  return 0;
+#endif
 }
 
 __attribute__((always_inline)) inline uint8_t samplePitchBack(
     uint16_t backU, uint16_t backV, uint8_t backAlpha = 255) {
-#if GLOBE_ENABLE_BACK_HEMISPHERE
+#if GLOBE_ENABLE_BACK_HEMISPHERE && GLOBE_TILTED_BACK_MODE != 3
+#if GLOBE_TILTED_BACK_MODE == 0
   const uint8_t *__restrict__ backTextureRow =
       pitchBackTextureHigh + static_cast<uint32_t>(backV) *
                                  world_texture::kWidth;
   uint8_t backIntensity = backTextureRow[backU] & 0x0FU;
+#else
+  uint8_t backIntensity = samplePitchBackTiled(backU, backV);
+#endif
 #if GLOBE_ENABLE_SCREENSHOT
   if (!screenshotBackHemisphereEnabled) {
     backIntensity = 0;
@@ -3404,13 +3602,20 @@ void setup() {
   pitchExactMap = static_cast<uint8_t *>(heap_caps_malloc(
       pitchExactMapByteCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   pitchFrontTexture = static_cast<uint8_t *>(heap_caps_malloc(
-      globe_texture::kByteCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  pitchBackTextureHigh = static_cast<uint8_t *>(heap_caps_malloc(
-      world_texture::kByteCount,
+      kPitchFrontTextureByteCount,
       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#if GLOBE_TILTED_BACK_MODE != 3
+  pitchBackTextureHigh = static_cast<uint8_t *>(heap_caps_malloc(
+      kPitchBackTextureByteCount,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#endif
   pitchAllocationFailed |=
       sphereNzQ15 == nullptr || pitchExactMap == nullptr ||
-      pitchFrontTexture == nullptr || pitchBackTextureHigh == nullptr;
+      pitchFrontTexture == nullptr
+#if GLOBE_TILTED_BACK_MODE != 3
+      || pitchBackTextureHigh == nullptr
+#endif
+      ;
 #endif
   overlayPixels = static_cast<uint32_t *>(heap_caps_malloc(
       static_cast<size_t>(kOverlayPixelCapacity) * sizeof(uint32_t),
@@ -3431,10 +3636,7 @@ void setup() {
   initializeBackground(frameBuffers[1], kFrameWidth, kFrameHeight,
                        kFrameScreenX, kFrameScreenY);
 #if GLOBE_ENABLE_XY_ROTATION
-  memcpy(pitchFrontTexture, globe_texture::kIntensity,
-         globe_texture::kByteCount);
-  memcpy(pitchBackTextureHigh, world_texture::kIntensity,
-         world_texture::kByteCount);
+  preparePitchTextures();
 #endif
 
   buildColorPalettes();
@@ -3490,9 +3692,11 @@ void setup() {
                 pitchPreviewMapByteCount * 2);
   Serial.printf("Pitch exact:  %u bytes (front + back dense map)\n",
                 pitchExactMapByteCount);
-  Serial.printf("Pitch texture:%u bytes (PSRAM front + high-res back)\n",
-                globe_texture::kByteCount +
-                    world_texture::kByteCount);
+  Serial.printf(
+      "Pitch texture:%u bytes (front tiled=%u, back mode=%u)\n",
+      static_cast<unsigned>(kPitchTextureByteCount),
+      static_cast<unsigned>(GLOBE_TILTED_FRONT_TILED),
+      static_cast<unsigned>(GLOBE_TILTED_BACK_MODE));
 #endif
   Serial.printf("World texture:%u bytes\n", globe_texture::kByteCount);
   Serial.printf("Overlay pixels:%u (%u bytes)\n", overlayPixelCount,

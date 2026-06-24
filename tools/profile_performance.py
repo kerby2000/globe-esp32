@@ -12,8 +12,10 @@ import serial
 
 MAGIC = b"GLBQ"
 PITCH_MAGIC = b"GLBT"
+MEMORY_MAGIC = b"GLBM"
 RECORD = struct.Struct("<8I")
 PITCH_RECORD = struct.Struct("<hhBBBBII")
+MEMORY_RECORD = struct.Struct("<IIIIBBBB")
 PITCH_MODE_NAMES = {0: "zero", 1: "preview", 2: "exact", 3: "anchor"}
 
 
@@ -55,6 +57,17 @@ def snapshot(port: serial.Serial) -> tuple[int, ...]:
     deadline = time.monotonic() + 5.0
     find_magic(port, deadline)
     return RECORD.unpack(read_exact(port, RECORD.size, deadline))
+
+
+def memory_status(port: serial.Serial) -> tuple[int, ...]:
+    port.reset_input_buffer()
+    port.write(b"H")
+    port.flush()
+    deadline = time.monotonic() + 5.0
+    find_marker(port, MEMORY_MAGIC, deadline)
+    return MEMORY_RECORD.unpack(
+        read_exact(port, MEMORY_RECORD.size, deadline)
+    )
 
 
 def delta32(current: int, previous: int) -> int:
@@ -158,6 +171,25 @@ def main() -> None:
         port.rts = False
         time.sleep(args.warmup)
         wait_for_firmware(port)
+        (
+            psram_total,
+            psram_free,
+            psram_largest,
+            tilted_texture_bytes,
+            front_tiled,
+            back_mode,
+            zero_half_back,
+            _reserved,
+        ) = memory_status(port)
+        print(
+            f"PSRAM total/free/largest: "
+            f"{psram_total / 1048576:.2f}/"
+            f"{psram_free / 1048576:.2f}/"
+            f"{psram_largest / 1048576:.2f} MiB; "
+            f"tilted textures={tilted_texture_bytes / 1024:.1f} KiB, "
+            f"front-tiled={bool(front_tiled)}, back-mode={back_mode}, "
+            f"zero-half-back={bool(zero_half_back)}"
+        )
         commands = bytearray(
             b"A" if args.phase == "anchor"
             else (b"V" if args.phase == "preview" else b"X")

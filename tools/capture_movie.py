@@ -226,6 +226,12 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=12.0)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--settle", type=float, default=0.08)
+    parser.add_argument(
+        "--post-ready-settle",
+        type=float,
+        default=0.0,
+        help="wait after the selected pitch renderer becomes active",
+    )
     parser.add_argument("--output", type=Path, default=Path("globe.mp4"))
     parser.add_argument(
         "--with-overlay",
@@ -276,6 +282,8 @@ def main() -> None:
                 args.settle,
                 args.timeout,
             )
+            if args.post_ready_settle > 0:
+                time.sleep(args.post_ready_settle)
 
             for index in range(args.frames):
                 width, height, payload, crc = request_frame(
